@@ -961,26 +961,10 @@ class Qwen3_5RMSNorm(nn.Module):
         super().__init__()
         self.eps = eps
         self.weight = nn.Parameter(torch.zeros(dim))
-        try:
-            from mojo_opset import MojoRMSNormFunction
-
-            self._mojo_rms = MojoRMSNormFunction
-        except ImportError:
-            logger.warning("MojoRMSNormFunction not found, fallback to eager implementation")
-            self._mojo_rms = None
-
-    def _norm(self, x):
-        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+        self._mojo_rms = MojoRMSNormFunction
 
     def forward(self, x):
-        if self._mojo_rms is None:
-            output = self._norm(x.float())
-            # Llama does x.to(float16) * w whilst Qwen3Next is (x * w).to(float16)
-            # See https://github.com/huggingface/transformers/pull/29402
-            output = output * (1.0 + self.weight.float())
-            return output.type_as(x)
-        else:
-            return self._mojo_rms.apply(x, 1.0 + self.weight.float(), self.eps)
+        return self._mojo_rms.apply(x, 1.0 + self.weight.float(), self.eps)
 
     def extra_repr(self):
         return f"{tuple(self.weight.shape)}, eps={self.eps}"
@@ -1963,7 +1947,7 @@ class Qwen3_5Model(Qwen3_5PreTrainedModel):
             image_embeds = image_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
             inputs_embeds = inputs_embeds.masked_scatter(embeds_image_mask, image_embeds)
 
-            # sequence parallel patch for image_mask & deepstack_image_embeds
+            # sequence parallel patch for image_mask
             if get_parallel_state().sp_enabled:
                 seq_len = image_mask.shape[1]
 
@@ -2007,7 +1991,7 @@ class Qwen3_5Model(Qwen3_5PreTrainedModel):
             video_embeds = video_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
             inputs_embeds = inputs_embeds.masked_scatter(embeds_video_mask, video_embeds)
 
-            # sequence parallel patch for video_mask & deepstack_video_embeds
+            # sequence parallel patch for video_mask
             if get_parallel_state().sp_enabled:
                 seq_len = video_mask.shape[1]
 
