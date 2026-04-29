@@ -392,6 +392,7 @@ def process_sample_qwen_vl(
 
 @DATA_TRANSFORM_REGISTRY.register("qwen2_5_omni")
 @DATA_TRANSFORM_REGISTRY.register("qwen3_omni_moe")
+@DATA_TRANSFORM_REGISTRY.register("qwen3_5_omni_moe")
 def process_sample_qwen_omni(
     sample: Dict[str, Any],
     processor: "ProcessorMixin",
