@@ -522,6 +522,9 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
         # Modification: plumb varlen sequence metadata to FLA kernels.
         cu_seq_lens_q: torch.Tensor | None = None,
     ):
+        cu_seq_lens_q = cu_seq_lens_q.pin_memory().to(
+            device=torch.npu.current_device(), non_blocking=True
+        )
         hidden_states = apply_mask_to_padding_states(hidden_states, attention_mask)
 
         # Set up dimensions for reshapes later
@@ -1751,7 +1754,7 @@ class Qwen3OmniMoePreTrainedModel(PreTrainedModel):
     base_model_prefix = "model"
     input_modalities = ("image", "video", "audio", "text")
     supports_gradient_checkpointing = True
-    _no_split_modules = ["Qwen3OmniMoeDecoderLayer", "Qwen3OmniMoeVisionBlock"]
+    _no_split_modules = ["Qwen3_5MoeDecoderLayer", "Qwen3_5MoeVisionModel", "Qwen3OmniMoeAudioEncoder"]
     _skip_keys_device_placement = "past_key_values"
     _supports_flash_attn = True
     _supports_sdpa = True
@@ -2239,7 +2242,7 @@ class Qwen3OmniMoeAudioEncoder(Qwen3OmniMoePreTrainedModel):
     config: Qwen3OmniMoeAudioEncoderConfig
     main_input_name = "input_features"
     input_modalities = "audio"
-    _no_split_modules = ["Qwen3OmniMoeAudioEncoderLayer"]
+    _no_split_modules = ["Qwen3OmniMoeAudioEncoder"]
     _supports_sdpa = True
     _can_record_outputs = {
         "hidden_states": Qwen3OmniMoeAudioEncoderLayer,
@@ -2579,7 +2582,7 @@ class Qwen3_5OmniMoeThinkerForConditionalGeneration(
     base_model_prefix = "thinker"
     _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
     _no_split_modules = [
-        "Qwen3OmniMoeAudioEncoderLayer",
+        "Qwen3OmniMoeAudioEncoder",
         "Qwen3_5MoeDecoderLayer",
     ]
 
@@ -3111,7 +3114,7 @@ class Qwen3_5OmniMoeForConditionalGeneration(Qwen3OmniMoePreTrainedModel, Genera
         self._no_split_modules = {
             "Qwen3_5MoeDecoderLayer",
             "Qwen3_5MoeVisionModel",
-            "Qwen3OmniMoeAudioEncoderLayer",
+            "Qwen3OmniMoeAudioEncoder",
         }
         # --- Patch.3 ---
 
