@@ -619,7 +619,7 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
                     activation=self.activation,
                     seq_idx=None,
                     backend="triton",
-                    cu_seqlens=cu_seq_lens_q.npu(),
+                    cu_seqlens=cu_seq_lens_q,
                 )[0]
             else:
                 raise NotImplementedError("This path is not supported yet because it can't process varlen now.")
@@ -669,7 +669,7 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
                     initial_state=None,
                     output_final_state=cache_params is not None,
                     use_qk_l2norm_in_kernel=True,
-                    cu_seqlens=cu_seq_lens_q.npu(),
+                    cu_seqlens=cu_seq_lens_q,
                 )
         else:
             core_attn_out, last_recurrent_state = self.recurrent_gated_delta_rule(
@@ -895,13 +895,12 @@ class Qwen3_5MoeExperts(nn.Module):
         top_k_index: torch.Tensor,
         top_k_weights: torch.Tensor,
     ) -> torch.Tensor:
-        final_hidden_states = torch.zeros_like(hidden_states)
         # Modification: dispatch to fused MoE when _moe_implementation is set.
         # Pass gate_up_proj directly as fc1_1_2_weight to avoid chunk + contiguous overhead.
         if self._moe_implementation == "fused":
             final_hidden_states = fused_moe_forward(
                 num_experts=self.num_experts,
-                routing_weights=top_k_weights.to(final_hidden_states.dtype),
+                routing_weights=top_k_weights.to(hidden_states.dtype),
                 selected_experts=top_k_index,
                 hidden_states=hidden_states,
                 fc1_1_weight=None,
@@ -1123,11 +1122,7 @@ class Qwen3_5MoeVisionPatchEmbed(nn.Module):
         self.proj = nn.Conv3d(self.in_channels, self.embed_dim, kernel_size=kernel_size, stride=kernel_size, bias=True)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        target_dtype = self.proj.weight.dtype
-        hidden_states = hidden_states.view(
-            -1, self.in_channels, self.temporal_patch_size, self.patch_size, self.patch_size
-        )
-        hidden_states = self.proj(hidden_states.to(dtype=target_dtype)).view(-1, self.embed_dim)
+        hidden_states = F.linear(hidden_states, self.proj.weight.flatten(1), self.proj.bias)
         return hidden_states
 
 
@@ -1424,6 +1419,8 @@ class Qwen3_5MoeVisionModel(Qwen3_5MoePreTrainedModel):
             `torch.Tensor`: hidden_states.
         """
         hidden_states = self.patch_embed(hidden_states)
+
+        grid_thw = grid_thw.to('cpu')
 
         pos_embeds = self.fast_pos_embed_interpolate(grid_thw)
 
@@ -2347,13 +2344,20 @@ class Qwen3OmniMoeAudioEncoder(Qwen3OmniMoePreTrainedModel):
                 input_features = unpad_tensor(input_features, dim=1, padding_size=sp_input_padding)
         # --- Patch.2 ---
 
-        chunk_list = input_features.T.split(chunk_lengths.tolist(), dim=0)
-        padded_feature = nn.utils.rnn.pad_sequence(chunk_list, batch_first=True).transpose(1, 2)
+        num_mel_bins = input_features.shape[0]
+        chunk_lengths_on_feature_device = chunk_lengths.to(input_features.device)
+        num_chunks = chunk_lengths_on_feature_device.numel()
+        max_chunk_len = chunk_lengths_on_feature_device.max().item()
+        chunk_starts = F.pad(chunk_lengths_on_feature_device, (1, 0), value=0).cumsum(0)[:-1]
+        chunk_offsets = torch.arange(max_chunk_len, device=input_features.device)
+        chunk_valid_mask = chunk_offsets.unsqueeze(0) < chunk_lengths_on_feature_device.unsqueeze(1)
+        chunk_indices = chunk_starts.unsqueeze(1) + chunk_offsets.unsqueeze(0)
+        chunk_indices = chunk_indices.masked_fill(~chunk_valid_mask, 0)
+        padded_feature = input_features.index_select(1, chunk_indices.reshape(-1))
+        padded_feature = padded_feature.view(num_mel_bins, num_chunks, max_chunk_len).permute(1, 0, 2)
+        padded_feature = padded_feature.masked_fill(~chunk_valid_mask.unsqueeze(1), 0)
         feature_lens_after_cnn = _get_feat_extract_output_lengths(chunk_lengths)
-        padded_mask_after_cnn = nn.utils.rnn.pad_sequence(
-            [torch.ones(length, dtype=torch.bool, device=padded_feature.device) for length in feature_lens_after_cnn],
-            batch_first=True,
-        )
+        
         padded_feature = padded_feature.unsqueeze(1)
         padded_embeds = []
         for chunk in padded_feature.split(self.conv_chunksize, dim=0):
@@ -2363,6 +2367,11 @@ class Qwen3OmniMoeAudioEncoder(Qwen3OmniMoePreTrainedModel):
             padded_embeds.append(padded_embed)
         padded_embed = torch.cat(padded_embeds, dim=0)
         b, c, f, t = padded_embed.size()
+
+        padded_mask_after_cnn = torch.arange(t, device=padded_embed.device).unsqueeze(0) < feature_lens_after_cnn.to(
+            padded_embed.device
+        ).unsqueeze(1)
+
         padded_embed = self.conv_out(padded_embed.permute(0, 3, 1, 2).contiguous().view(b, t, c * f))
 
         positional_embedding = (
@@ -2379,7 +2388,7 @@ class Qwen3OmniMoeAudioEncoder(Qwen3OmniMoePreTrainedModel):
             remainder = cnn_len % window_aftercnn
             if remainder != 0:
                 cu_chunk_lens += [remainder]
-        cu_seqlens = torch.tensor(cu_chunk_lens, device=aftercnn_lens.device).cumsum(-1, dtype=torch.int32)
+        cu_seqlens = torch.tensor(cu_chunk_lens, device='cpu').cumsum(-1, dtype=torch.int32)
 
         # --- Patch.3 ---
         if get_parallel_state().sp_enabled:

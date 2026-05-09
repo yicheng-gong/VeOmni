@@ -201,7 +201,7 @@ class VLMTrainer:
         )
 
     def _build_collate_fn(self):
-        if self.base.model_config.model_type in ("qwen2_5_omni", "qwen3_omni_moe"):
+        if self.base.model_config.model_type in ("qwen2_5_omni", "qwen3_omni_moe", "qwen3_5_omni_moe"):
             data_collate_info = {
                 "audio_feature_lengths": (0, False, None, None),
                 "input_features": (0, True, 0, 1),

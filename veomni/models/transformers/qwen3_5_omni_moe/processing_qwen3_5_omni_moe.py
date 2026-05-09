@@ -111,6 +111,21 @@ def _get_feat_extract_output_lengths(input_lengths):
     return output_lengths
 
 
+def _normalize_video_kwargs_for_qwen3_vl(videos_kwargs):
+    min_pixels = videos_kwargs.pop("min_pixels", None)
+    max_pixels = videos_kwargs.pop("max_pixels", None)
+    if min_pixels is None and max_pixels is None:
+        return videos_kwargs
+
+    size = dict(videos_kwargs.get("size") or {})
+    if min_pixels is not None:
+        size["shortest_edge"] = min_pixels
+    if max_pixels is not None:
+        size["longest_edge"] = max_pixels
+    videos_kwargs["size"] = size
+    return videos_kwargs
+
+
 class Qwen3_5OmniMoeProcessor(Qwen3OmniMoeProcessor):
     def __call__(
         self,
@@ -138,6 +153,7 @@ class Qwen3_5OmniMoeProcessor(Qwen3OmniMoeProcessor):
         # --- Patch.2 ---
         _ = output_kwargs["videos_kwargs"].pop("use_audio_in_video")
         # --- Patch.2 ---
+        output_kwargs["videos_kwargs"] = _normalize_video_kwargs_for_qwen3_vl(output_kwargs["videos_kwargs"])
 
         # Modification: use truthy check instead of `is not None`
         if audios:

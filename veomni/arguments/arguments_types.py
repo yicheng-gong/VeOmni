@@ -665,6 +665,8 @@ class OpsImplementationConfig:
         metadata={
             "help": "Cross-entropy loss implementation. "
             "'liger_kernel' uses LigerFusedLinearCrossEntropyLoss (requires liger-kernel). "
+            "'npu_fused_linear' uses torch_npu ACLNN fused linear cross entropy "
+            "(requires torch_npu). "
             "'npu' enables chunked loss computation for CausalLM on NPU "
             "(requires torch_npu). "
             "'eager' (default) uses PyTorch F.cross_entropy."

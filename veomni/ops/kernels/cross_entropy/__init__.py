@@ -214,6 +214,10 @@ register_op(
                 entry="veomni.ops.kernels.cross_entropy.liger:fused_liger_kernel_cross_entropy",
                 requires=("liger_kernel",),
             ),
+            "npu_fused_linear": BackendSpec(
+                entry="veomni.ops.kernels.cross_entropy.npu_fused_linear:npu_fused_linear_cross_entropy",
+                requires=("torch_npu",),
+            ),
             # NPU chunked loss still uses eager as the inner kernel; the
             # side_effect installs ``chunk_loss_function`` in ``LOSS_MAPPING``.
             "npu": BackendSpec(
