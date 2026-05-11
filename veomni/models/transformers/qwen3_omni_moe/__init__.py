@@ -11,6 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import os
+
 from ....utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE
 from ....utils.import_utils import is_transformers_version_greater_or_equal_to
 from ...loader import MODEL_CONFIG_REGISTRY, MODEL_PROCESSOR_REGISTRY, MODELING_REGISTRY
@@ -50,11 +52,18 @@ def register_qwen3_omni_moe_modeling(architecture: str):
                 Qwen3OmniMoeThinkerTextModel,
             )
         elif IS_NPU_AVAILABLE:
-            from .generated.patched_modeling_qwen3_omni_moe_npu import (
-                Qwen3OmniMoeForConditionalGeneration,
-                Qwen3OmniMoeThinkerForConditionalGeneration,
-                Qwen3OmniMoeThinkerTextModel,
-            )
+            if int(os.getenv("USING_BIGOP", "0")) == 1:
+                from .generated.patched_modeling_qwen3_omni_moe_bigop import (
+                    Qwen3OmniMoeForConditionalGeneration,
+                    Qwen3OmniMoeThinkerForConditionalGeneration,
+                    Qwen3OmniMoeThinkerTextModel,
+                )
+            else:
+                from .generated.patched_modeling_qwen3_omni_moe_npu import (
+                    Qwen3OmniMoeForConditionalGeneration,
+                    Qwen3OmniMoeThinkerForConditionalGeneration,
+                    Qwen3OmniMoeThinkerTextModel,
+                )
 
         # The thinker text submodel is also loadable standalone (e.g. when the
         # registry dispatches on architecture == "...ThinkerTextModel"), so the

@@ -54,70 +54,45 @@
 #
 # ==============================================================================
 
-import copy
 import math
 from collections.abc import Callable
 from dataclasses import dataclass
-from functools import partial
-from types import SimpleNamespace
 from typing import Optional
-
 import numpy as np
 import torch
-
-# Additional imports for patches
-import torch_npu
 from torch import nn
+from torch.nn import Parameter
 from torch.nn import functional as F
 from transformers import initialization as init
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.generation import GenerationMixin
-from transformers.integrations import (
-    use_kernel_forward_from_hub,
-    use_kernelized_func,
-)
-from transformers.masking_utils import create_causal_mask
+from transformers.integrations import use_experts_implementation, use_kernel_forward_from_hub, use_kernel_func_from_hub, use_kernelized_func
+from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
 from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 from transformers.modeling_layers import GradientCheckpointingLayer
-from transformers.modeling_outputs import (
-    BaseModelOutputWithPooling,
-    MoeCausalLMOutputWithPast,
-    MoeModelOutputWithPast,
-)
+from transformers.modeling_outputs import BaseModelOutputWithPast, BaseModelOutputWithPooling, CausalLMOutputWithPast, MoeCausalLMOutputWithPast, MoeModelOutputWithPast
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
-from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
-    Qwen3OmniMoeAudioEncoderConfig,
-    Qwen3OmniMoeConfig,
-    Qwen3OmniMoeTextConfig,
-    Qwen3OmniMoeThinkerConfig,
-    Qwen3OmniMoeVisionEncoderConfig,
-)
 from transformers.processing_utils import Unpack
 from transformers.utils import auto_docstring, can_return_tuple, is_grouped_mm_available, torch_compilable_check
-from transformers.utils.generic import (
-    TransformersKwargs,
-    is_flash_attention_requested,
-    maybe_autocast,
-    merge_with_config_defaults,
-)
+from transformers.utils.generic import TransformersKwargs, is_flash_attention_requested, maybe_autocast, merge_with_config_defaults
 from transformers.utils.output_capturing import OutputRecorder, capture_outputs
+from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import Qwen3OmniMoeAudioEncoderConfig, Qwen3OmniMoeCode2WavConfig, Qwen3OmniMoeConfig, Qwen3OmniMoeTalkerCodePredictorConfig, Qwen3OmniMoeTalkerConfig, Qwen3OmniMoeTalkerTextConfig, Qwen3OmniMoeTextConfig, Qwen3OmniMoeThinkerConfig, Qwen3OmniMoeVisionEncoderConfig
+from transformers.integrations.npu_flash_attention import get_attn_mask_npu, SPARSE_MODE
 
+# Additional imports for patches
+import torch_npu
+import copy
+from functools import partial
+from types import SimpleNamespace
+import torch.nn.functional as F
 from veomni.distributed.parallel_state import get_parallel_state
-from veomni.distributed.sequence_parallel import (
-    gather_heads_scatter_seq,
-    gather_outputs,
-    gather_seq_scatter_heads,
-    slice_input_tensor,
-    sp_pad_and_slice,
-    unpad_tensor,
-)
+from veomni.distributed.sequence_parallel import gather_heads_scatter_seq, gather_outputs, gather_seq_scatter_heads, slice_input_tensor, sp_pad_and_slice, unpad_tensor
 from veomni.distributed.sequence_parallel.ulysses import _Gather
 from veomni.models.transformers.attention_utils import VARLEN_ATTENTION_TYPES
 from veomni.ops import fused_moe_forward
 from veomni.utils.constants import AUDIO_INPUT_INDEX, IGNORE_INDEX, IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
-
 
 # Additional import blocks for patches
 def get_position_id(main_func, self, **kwargs):
@@ -434,9 +409,7 @@ class Qwen3OmniMoePreTrainedModelForConditionalGeneration(Qwen3OmniMoePreTrained
                             grid_hs = video_grid_thw[:, 1]
                             grid_ws = video_grid_thw[:, 2]
                             t_index = (
-                                torch.arange(grid_t)
-                                * second_per_grids[video_idx].cpu().float()
-                                * position_id_per_seconds
+                                torch.arange(grid_t) * second_per_grids[video_idx].cpu().float() * position_id_per_seconds
                             ).float()
                             llm_pos_ids = self.get_llm_pos_ids_for_vision(
                                 st_idx, video_idx, spatial_merge_size, t_index, grid_hs, grid_ws
@@ -455,9 +428,7 @@ class Qwen3OmniMoePreTrainedModelForConditionalGeneration(Qwen3OmniMoePreTrained
                             grid_hs = video_grid_thw[:, 1]
                             grid_ws = video_grid_thw[:, 2]
                             t_index = (
-                                torch.arange(grid_t)
-                                * second_per_grids[video_idx].cpu().float()
-                                * position_id_per_seconds
+                                torch.arange(grid_t) * second_per_grids[video_idx].cpu().float() * position_id_per_seconds
                             ).float()
                             video_llm_pos_ids = self.get_llm_pos_ids_for_vision(
                                 st_idx, video_idx, spatial_merge_size, t_index, grid_hs, grid_ws
@@ -468,14 +439,10 @@ class Qwen3OmniMoePreTrainedModelForConditionalGeneration(Qwen3OmniMoePreTrained
                                 and audio_data_index < audio_llm_pos_ids.shape[-1]
                             ):
                                 if video_llm_pos_ids[0][video_data_index] <= audio_llm_pos_ids[0][audio_data_index]:
-                                    llm_pos_ids_list.append(
-                                        video_llm_pos_ids[:, video_data_index : video_data_index + 1]
-                                    )
+                                    llm_pos_ids_list.append(video_llm_pos_ids[:, video_data_index : video_data_index + 1])
                                     video_data_index += 1
                                 else:
-                                    llm_pos_ids_list.append(
-                                        audio_llm_pos_ids[:, audio_data_index : audio_data_index + 1]
-                                    )
+                                    llm_pos_ids_list.append(audio_llm_pos_ids[:, audio_data_index : audio_data_index + 1])
                                     audio_data_index += 1
                             if video_data_index < video_llm_pos_ids.shape[-1]:
                                 llm_pos_ids_list.append(
@@ -626,6 +593,472 @@ class Qwen3OmniMoeAudioAttention(nn.Module):
         return attn_output
 
 
+class Qwen3OmniMoeAudioBigopEncoderLayer(torch.autograd.Function):
+
+    @staticmethod
+    def _accumulate_grad(param, grad):
+        if param is None or grad is None or not param.requires_grad:
+            return
+        grad = grad.to(param.dtype)
+        if param.grad is None:
+            param.grad = grad
+        else:
+            param.grad.add_(grad)
+
+    @staticmethod
+    def _linear_backward(grad_output, input_, weight, bias=None):
+        grad_output_2d = grad_output.reshape(-1, grad_output.shape[-1])
+        input_2d = input_.reshape(-1, input_.shape[-1])
+
+        grad_input = grad_output_2d.matmul(weight).reshape_as(input_)
+        grad_weight = grad_output_2d.t().matmul(input_2d) if weight.requires_grad else None
+        grad_bias = grad_output_2d.sum(dim=0) if bias is not None and bias.requires_grad else None
+        return grad_input, grad_weight, grad_bias
+
+    @staticmethod
+    def forward(
+        ctx,
+        hidden_states,
+        cu_seqlens,
+        attention_mask,
+        self_attn_layer_norm,
+        self_attn,
+        final_layer_norm,
+        fc1,
+        fc2,
+        activation_function,
+    ):
+        if cu_seqlens is None:
+            raise ValueError("cu_seqlens must be provided for the bigop audio encoder layer")
+        if attention_mask is not None:
+            raise ValueError("attention_mask is not supported by the bigop audio encoder layer")
+
+        # ============================================================
+        # 1. self_attn_layer_norm
+        # origin:
+        #   hidden_states = self.self_attn_layer_norm(hidden_states)
+        # backward needs:
+        #   layer norm input, mean, rstd and output
+        # ============================================================
+        residual = hidden_states
+        self_attn_layer_norm_input = hidden_states
+
+        hidden_states, self_attn_layer_norm_mean, self_attn_layer_norm_rstd = torch.native_layer_norm(
+            hidden_states,
+            self_attn_layer_norm.normalized_shape,
+            self_attn_layer_norm.weight,
+            self_attn_layer_norm.bias,
+            self_attn_layer_norm.eps,
+        )
+        self_attn_layer_norm_output = hidden_states
+
+        # ============================================================
+        # 2. Audio self attention inline
+        # origin:
+        #   hidden_states = self.self_attn(...)
+        # ============================================================
+        seq_length = hidden_states.shape[0]
+
+        # ----------------------------
+        # q / k / v projections
+        # origin:
+        #   query_states = self.q_proj(hidden_states).reshape(seq_length, self.num_heads, -1)
+        # ----------------------------
+        q_proj_output = F.linear(
+            hidden_states,
+            self_attn.q_proj.weight,
+            self_attn.q_proj.bias,
+        )
+        k_proj_output = F.linear(
+            hidden_states,
+            self_attn.k_proj.weight,
+            self_attn.k_proj.bias,
+        )
+        v_proj_output = F.linear(
+            hidden_states,
+            self_attn.v_proj.weight,
+            self_attn.v_proj.bias,
+        )
+        query_states = q_proj_output.reshape(seq_length, self_attn.num_heads, -1)
+        key_states = k_proj_output.reshape(seq_length, self_attn.num_heads, -1)
+        value_states = v_proj_output.reshape(seq_length, self_attn.num_heads, -1)
+
+        # ----------------------------
+        # non-causal varlen attention backend
+        # origin:
+        #   attention_interface(..., is_causal=False, cu_seq_lens_q=cu_seqlens, ...)
+        # backward needs:
+        #   q/k/v, attention output and softmax stats
+        # ----------------------------
+        head_num = query_states.shape[1]
+        softmax_scale = self_attn.scaling
+        dropout_p = 0.0 if not self_attn.training else self_attn.attention_dropout
+        keep_prob = 1 - dropout_p
+        actual_seq_len = tuple(cu_seqlens[1:].tolist())
+        del cu_seqlens
+
+        attn_result = torch_npu.npu_fusion_attention(
+            query_states,
+            key_states,
+            value_states,
+            head_num,
+            pse=None,
+            atten_mask=None,
+            scale=softmax_scale,
+            keep_prob=keep_prob,
+            input_layout="TND",
+            actual_seq_qlen=actual_seq_len,
+            actual_seq_kvlen=actual_seq_len,
+        )
+        attn_output_tnd = attn_result[0]
+        softmax_max = attn_result[1]
+        softmax_sum = attn_result[2]
+        del attn_result
+
+        # ----------------------------
+        # output projection
+        # origin:
+        #   attn_output = self.out_proj(attn_output.reshape(seq_length, -1).contiguous())
+        # ----------------------------
+        out_proj_input = attn_output_tnd.reshape(seq_length, -1).contiguous()
+        attn_output = F.linear(
+            out_proj_input,
+            self_attn.out_proj.weight,
+            self_attn.out_proj.bias,
+        )
+
+        hidden_states = residual + attn_output
+        del attn_output
+
+        # ============================================================
+        # 3. final_layer_norm
+        # origin:
+        #   hidden_states = self.final_layer_norm(hidden_states)
+        # backward needs:
+        #   layer norm input, mean, rstd and output
+        # ============================================================
+        residual = hidden_states
+        final_layer_norm_input = hidden_states
+
+        hidden_states, final_layer_norm_mean, final_layer_norm_rstd = torch.native_layer_norm(
+            hidden_states,
+            final_layer_norm.normalized_shape,
+            final_layer_norm.weight,
+            final_layer_norm.bias,
+            final_layer_norm.eps,
+        )
+        final_layer_norm_output = hidden_states
+
+        # ============================================================
+        # 4. FFN inline
+        # origin:
+        #   hidden_states = self.fc2(self.activation_fn(self.fc1(hidden_states)))
+        # ============================================================
+        fc1_output = F.linear(
+            hidden_states,
+            fc1.weight,
+            fc1.bias,
+        )
+        fc1_activation = F.gelu(fc1_output, approximate="tanh")
+        fc2_output = F.linear(
+            fc1_activation,
+            fc2.weight,
+            fc2.bias,
+        )
+
+        # ============================================================
+        # 5. residual add
+        # origin:
+        #   hidden_states = residual + hidden_states
+        # backward needs:
+        #   all intermediate tensors required by the manually fused layer
+        # ============================================================
+        hidden_states = residual + fc2_output
+        del fc2_output
+
+        ctx.save_for_backward(
+            self_attn_layer_norm_input,
+            self_attn_layer_norm_output,
+            self_attn_layer_norm_mean,
+            self_attn_layer_norm_rstd,
+            q_proj_output,
+            k_proj_output,
+            v_proj_output,
+            query_states,
+            key_states,
+            value_states,
+            attn_output_tnd,
+            softmax_max,
+            softmax_sum,
+            out_proj_input,
+            final_layer_norm_input,
+            final_layer_norm_output,
+            final_layer_norm_mean,
+            final_layer_norm_rstd,
+            fc1_output,
+            fc1_activation,
+        )
+        ctx.self_attn_layer_norm = self_attn_layer_norm
+        ctx.self_attn = self_attn
+        ctx.final_layer_norm = final_layer_norm
+        ctx.fc1 = fc1
+        ctx.fc2 = fc2
+        ctx.activation_function = activation_function
+        ctx.head_num = head_num
+        ctx.softmax_scale = softmax_scale
+        ctx.keep_prob = keep_prob
+        ctx.actual_seq_len = actual_seq_len
+        return hidden_states
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        (
+            self_attn_layer_norm_input,
+            self_attn_layer_norm_output,
+            self_attn_layer_norm_mean,
+            self_attn_layer_norm_rstd,
+            q_proj_output,
+            k_proj_output,
+            v_proj_output,
+            query_states,
+            key_states,
+            value_states,
+            attn_output_tnd,
+            softmax_max,
+            softmax_sum,
+            out_proj_input,
+            final_layer_norm_input,
+            final_layer_norm_output,
+            final_layer_norm_mean,
+            final_layer_norm_rstd,
+            fc1_output,
+            fc1_activation,
+        ) = ctx.saved_tensors
+        if hasattr(ctx, "maybe_clear_saved_tensors"):
+            ctx.maybe_clear_saved_tensors()
+
+        self_attn_layer_norm = ctx.self_attn_layer_norm
+        self_attn = ctx.self_attn
+        final_layer_norm = ctx.final_layer_norm
+        fc1 = ctx.fc1
+        fc2 = ctx.fc2
+        layer_cls = Qwen3OmniMoeAudioBigopEncoderLayer
+
+        # ============================================================
+        # 5. residual add
+        # origin:
+        #   hidden_states = residual + hidden_states
+        # backward:
+        #   split gradient to residual and FFN branch
+        # ============================================================
+        grad_output = grad_output.contiguous()
+        grad_residual = grad_output
+        grad_fc2_output = grad_output
+        del grad_output
+
+        # ============================================================
+        # 4. FFN inline backward
+        # origin:
+        #   hidden_states = self.fc2(self.activation_fn(self.fc1(hidden_states)))
+        # ============================================================
+        grad_fc1_activation, grad_fc2_weight, grad_fc2_bias = layer_cls._linear_backward(
+            grad_fc2_output,
+            fc1_activation,
+            fc2.weight,
+            fc2.bias,
+        )
+        del grad_fc2_output, fc1_activation
+
+        grad_fc1_output = torch.ops.aten.gelu_backward(
+            grad_fc1_activation, 
+            fc1_output, 
+            approximate="tanh"
+        )
+        del grad_fc1_activation, fc1_output
+
+        grad_final_layer_norm_output, grad_fc1_weight, grad_fc1_bias = layer_cls._linear_backward(
+            grad_fc1_output,
+            final_layer_norm_output,
+            fc1.weight,
+            fc1.bias,
+        )
+        del grad_fc1_output, final_layer_norm_output
+
+        # ============================================================
+        # 3. final_layer_norm backward
+        # origin:
+        #   hidden_states = self.final_layer_norm(hidden_states)
+        # ============================================================
+        grad_final_layer_norm_input, grad_final_layer_norm_weight, grad_final_layer_norm_bias = (
+            torch.ops.aten.native_layer_norm_backward(
+                grad_final_layer_norm_output.contiguous(),
+                final_layer_norm_input,
+                final_layer_norm.normalized_shape,
+                final_layer_norm_mean,
+                final_layer_norm_rstd,
+                final_layer_norm.weight,
+                final_layer_norm.bias,
+                (
+                    True,
+                    final_layer_norm.weight.requires_grad,
+                    final_layer_norm.bias is not None and final_layer_norm.bias.requires_grad,
+                ),
+            )
+        )
+        del grad_final_layer_norm_output, final_layer_norm_input, final_layer_norm_mean, final_layer_norm_rstd
+        grad_residual = grad_residual + grad_final_layer_norm_input
+        del grad_final_layer_norm_input
+
+        # ============================================================
+        # 2. Audio self attention inline backward
+        # origin:
+        #   hidden_states = self.self_attn(...)
+        # ============================================================
+        grad_attn_output = grad_residual
+
+        grad_out_proj_input, grad_out_proj_weight, grad_out_proj_bias = layer_cls._linear_backward(
+            grad_attn_output,
+            out_proj_input,
+            self_attn.out_proj.weight,
+            self_attn.out_proj.bias,
+        )
+        del grad_attn_output, out_proj_input
+
+        grad_query_states, grad_key_states, grad_value_states, _ = torch_npu.npu_fusion_attention_grad(
+            query_states,
+            key_states,
+            value_states,
+            grad_out_proj_input.reshape_as(attn_output_tnd).contiguous(),
+            ctx.head_num,
+            input_layout="TND",
+            pse=None,
+            atten_mask=None,
+            softmax_max=softmax_max,
+            softmax_sum=softmax_sum,
+            attention_in=attn_output_tnd,
+            scale_value=ctx.softmax_scale,
+            keep_prob=ctx.keep_prob,
+            actual_seq_qlen=ctx.actual_seq_len,
+            actual_seq_kvlen=ctx.actual_seq_len,
+        )
+        del query_states, key_states, value_states, grad_out_proj_input, attn_output_tnd, softmax_max, softmax_sum
+
+        grad_q_proj_output = grad_query_states.reshape_as(q_proj_output)
+        grad_k_proj_output = grad_key_states.reshape_as(k_proj_output)
+        grad_v_proj_output = grad_value_states.reshape_as(v_proj_output)
+        del grad_query_states, grad_key_states, grad_value_states
+
+        grad_q_input, grad_q_proj_weight, grad_q_proj_bias = layer_cls._linear_backward(
+            grad_q_proj_output,
+            self_attn_layer_norm_output,
+            self_attn.q_proj.weight,
+            self_attn.q_proj.bias,
+        )
+        del grad_q_proj_output, q_proj_output
+        grad_k_input, grad_k_proj_weight, grad_k_proj_bias = layer_cls._linear_backward(
+            grad_k_proj_output,
+            self_attn_layer_norm_output,
+            self_attn.k_proj.weight,
+            self_attn.k_proj.bias,
+        )
+        del grad_k_proj_output, k_proj_output
+        grad_v_input, grad_v_proj_weight, grad_v_proj_bias = layer_cls._linear_backward(
+            grad_v_proj_output,
+            self_attn_layer_norm_output,
+            self_attn.v_proj.weight,
+            self_attn.v_proj.bias,
+        )
+        del grad_v_proj_output, v_proj_output, self_attn_layer_norm_output
+        grad_self_attn_layer_norm_output = grad_q_input + grad_k_input + grad_v_input
+        del grad_q_input, grad_k_input, grad_v_input
+
+        # ============================================================
+        # 1. self_attn_layer_norm backward
+        # origin:
+        #   hidden_states = self.self_attn_layer_norm(hidden_states)
+        # ============================================================
+        grad_self_attn_layer_norm_input, grad_self_attn_layer_norm_weight, grad_self_attn_layer_norm_bias = (
+            torch.ops.aten.native_layer_norm_backward(
+                grad_self_attn_layer_norm_output.contiguous(),
+                self_attn_layer_norm_input,
+                self_attn_layer_norm.normalized_shape,
+                self_attn_layer_norm_mean,
+                self_attn_layer_norm_rstd,
+                self_attn_layer_norm.weight,
+                self_attn_layer_norm.bias,
+                (
+                    True,
+                    self_attn_layer_norm.weight.requires_grad,
+                    self_attn_layer_norm.bias is not None and self_attn_layer_norm.bias.requires_grad,
+                ),
+            )
+        )
+        del (
+            grad_self_attn_layer_norm_output,
+            self_attn_layer_norm_input,
+            self_attn_layer_norm_mean,
+            self_attn_layer_norm_rstd,
+        )
+
+        # ============================================================
+        # 0. first residual add backward
+        # origin:
+        #   hidden_states = residual + attn_output
+        # ============================================================
+        grad_hidden_states = grad_residual + grad_self_attn_layer_norm_input
+        del grad_residual, grad_self_attn_layer_norm_input
+
+        # ============================================================
+        # Parameter gradient accumulation
+        # origin:
+        #   module parameters are passed through the Function as modules,
+        #   so their gradients are accumulated explicitly.
+        # ============================================================
+        acc = layer_cls._accumulate_grad
+        acc(self_attn_layer_norm.weight, grad_self_attn_layer_norm_weight)
+        del grad_self_attn_layer_norm_weight
+        acc(self_attn_layer_norm.bias, grad_self_attn_layer_norm_bias)
+        del grad_self_attn_layer_norm_bias
+        acc(self_attn.q_proj.weight, grad_q_proj_weight)
+        del grad_q_proj_weight
+        acc(self_attn.q_proj.bias, grad_q_proj_bias)
+        del grad_q_proj_bias
+        acc(self_attn.k_proj.weight, grad_k_proj_weight)
+        del grad_k_proj_weight
+        acc(self_attn.k_proj.bias, grad_k_proj_bias)
+        del grad_k_proj_bias
+        acc(self_attn.v_proj.weight, grad_v_proj_weight)
+        del grad_v_proj_weight
+        acc(self_attn.v_proj.bias, grad_v_proj_bias)
+        del grad_v_proj_bias
+        acc(self_attn.out_proj.weight, grad_out_proj_weight)
+        del grad_out_proj_weight
+        acc(self_attn.out_proj.bias, grad_out_proj_bias)
+        del grad_out_proj_bias
+        acc(final_layer_norm.weight, grad_final_layer_norm_weight)
+        del grad_final_layer_norm_weight
+        acc(final_layer_norm.bias, grad_final_layer_norm_bias)
+        del grad_final_layer_norm_bias
+        acc(fc1.weight, grad_fc1_weight)
+        del grad_fc1_weight
+        acc(fc1.bias, grad_fc1_bias)
+        del grad_fc1_bias
+        acc(fc2.weight, grad_fc2_weight)
+        del grad_fc2_weight
+        acc(fc2.bias, grad_fc2_bias)
+        del grad_fc2_bias
+
+        ctx.self_attn_layer_norm = None
+        ctx.self_attn = None
+        ctx.final_layer_norm = None
+        ctx.fc1 = None
+        ctx.fc2 = None
+        ctx.activation_function = None
+        ctx.actual_seq_len = None
+
+        return grad_hidden_states, None, None, None, None, None, None, None, None
+
+
 class Qwen3OmniMoeAudioEncoderLayer(GradientCheckpointingLayer):
     def __init__(self, config: Qwen3OmniMoeAudioEncoderConfig):
         super().__init__()
@@ -635,6 +1068,7 @@ class Qwen3OmniMoeAudioEncoderLayer(GradientCheckpointingLayer):
         self.dropout = config.dropout
         self.activation_fn = ACT2FN[config.activation_function]
         self.activation_dropout = config.activation_dropout
+        self.activation_function = config.activation_function
         self.fc1 = nn.Linear(self.embed_dim, config.encoder_ffn_dim)
         self.fc2 = nn.Linear(config.encoder_ffn_dim, self.embed_dim)
         self.final_layer_norm = nn.LayerNorm(self.embed_dim)
@@ -655,21 +1089,17 @@ class Qwen3OmniMoeAudioEncoderLayer(GradientCheckpointingLayer):
                 Whether or not to return the attentions tensors of all attention layers. See `attentions` under
                 returned tensors for more detail.
         """
-        residual = hidden_states
-        hidden_states = self.self_attn_layer_norm(hidden_states)
-        hidden_states = self.self_attn(
-            hidden_states=hidden_states,
-            cu_seqlens=cu_seqlens,
-            attention_mask=attention_mask,
-            **kwargs,
+        hidden_states = Qwen3OmniMoeAudioBigopEncoderLayer.apply(
+            hidden_states,
+            cu_seqlens,
+            attention_mask,
+            self.self_attn_layer_norm,
+            self.self_attn,
+            self.final_layer_norm,
+            self.fc1,
+            self.fc2,
+            self.activation_function,
         )
-        hidden_states = residual + hidden_states
-        residual = hidden_states
-        hidden_states = self.final_layer_norm(hidden_states)
-        hidden_states = self.fc1(hidden_states)
-        hidden_states = self.activation_fn(hidden_states)
-        hidden_states = self.fc2(hidden_states)
-        hidden_states = residual + hidden_states
 
         if hidden_states.dtype == torch.float16:
             clamp_value = torch.finfo(hidden_states.dtype).max - 1000
@@ -820,9 +1250,7 @@ class Qwen3OmniMoeAudioEncoder(Qwen3OmniMoePreTrainedModel):
         padded_embed = self.conv_out(padded_embed.permute(0, 3, 1, 2).contiguous().view(b, t, c * f))
 
         positional_embedding = (
-            self.positional_embedding.positional_embedding[: padded_embed.shape[1], :]
-            .unsqueeze(0)
-            .to(padded_embed.dtype)
+            self.positional_embedding.positional_embedding[: padded_embed.shape[1], :].unsqueeze(0).to(padded_embed.dtype)
         )
         padded_embed = padded_embed + positional_embedding
         hidden_states = padded_embed[padded_mask_after_cnn]
@@ -1020,9 +1448,7 @@ class Qwen3OmniMoeVisionAttention(nn.Module):
             )
         else:
             lengths = cu_seqlens[1:] - cu_seqlens[:-1]
-            splits = [
-                torch.split(tensor, lengths.tolist(), dim=2) for tensor in (query_states, key_states, value_states)
-            ]
+            splits = [torch.split(tensor, lengths.tolist(), dim=2) for tensor in (query_states, key_states, value_states)]
             attn_outputs = [
                 attention_interface(
                     self,
@@ -1116,6 +1542,521 @@ class Qwen3OmniMoeVisionMLP(nn.Module):
         return self.linear_fc2(self.act_fn(self.linear_fc1(hidden_state)))
 
 
+class Qwen3OmniMoeVisionBigopBlock(torch.autograd.Function):
+
+    @staticmethod
+    def _accumulate_grad(param, grad):
+        if param is None or grad is None or not param.requires_grad:
+            return
+        grad = grad.to(param.dtype)
+        if param.grad is None:
+            param.grad = grad
+        else:
+            param.grad.add_(grad)
+
+    @staticmethod
+    def _linear_backward(grad_output, input_, weight, bias=None):
+        grad_output_2d = grad_output.reshape(-1, grad_output.shape[-1])
+        input_2d = input_.reshape(-1, input_.shape[-1])
+
+        grad_input = grad_output_2d.matmul(weight).reshape_as(input_)
+        grad_weight = grad_output_2d.t().matmul(input_2d) if weight.requires_grad else None
+        grad_bias = grad_output_2d.sum(dim=0) if bias is not None and bias.requires_grad else None
+        return grad_input, grad_weight, grad_bias
+
+    @staticmethod
+    def forward(
+        ctx,
+        hidden_states,
+        cu_seqlens,
+        rotary_pos_emb,
+        position_embeddings,
+        norm1,
+        attn,
+        norm2,
+        mlp,
+        kwargs,
+    ):
+        del rotary_pos_emb, kwargs
+
+        # ============================================================
+        # 1. norm1
+        # origin:
+        #   hidden_states = self.norm1(hidden_states)
+        # backward needs:
+        #   norm1 input, mean, rstd and output
+        # ============================================================
+        residual = hidden_states
+        norm1_input = hidden_states
+
+        hidden_states, norm1_mean, norm1_rstd = torch.native_layer_norm(
+            hidden_states,
+            norm1.normalized_shape,
+            norm1.weight,
+            norm1.bias,
+            norm1.eps,
+        )
+        norm1_output = hidden_states
+
+        # ============================================================
+        # 2. Vision Attention inline
+        # origin:
+        #   hidden_states = self.attn(...)
+        # ============================================================
+        seq_length = hidden_states.shape[0]
+
+        # ----------------------------
+        # qkv projection
+        # origin:
+        #   query_states, key_states, value_states = self.qkv(...).reshape(...).permute(...).unbind(0)
+        # backward needs:
+        #   qkv input and q/k before RoPE
+        # ----------------------------
+        qkv_output = F.linear(
+            hidden_states,
+            attn.qkv.weight,
+            attn.qkv.bias,
+        )
+        query_states_before_rope, key_states_before_rope, value_states = (
+            qkv_output.reshape(seq_length, 3, attn.num_heads, -1).permute(1, 0, 2, 3).unbind(0)
+        )
+        del qkv_output
+
+        # ----------------------------
+        # Vision RoPE inline
+        # origin:
+        #   query_states, key_states = apply_rotary_pos_emb_vision(query_states, key_states, cos, sin)
+        # ----------------------------
+        cos, sin = position_embeddings
+        cos = cos.unsqueeze(0).unsqueeze(2).float()
+        sin = sin.unsqueeze(0).unsqueeze(2).float()
+        del position_embeddings
+        query_states = torch_npu.npu_rotary_mul(
+            query_states_before_rope.unsqueeze(0),
+            cos,
+            sin,
+        ).squeeze(0)
+        key_states = torch_npu.npu_rotary_mul(
+            key_states_before_rope.unsqueeze(0),
+            cos,
+            sin,
+        ).squeeze(0)
+
+        # ----------------------------
+        # non-causal varlen attention backend
+        # origin:
+        #   attention_interface(..., is_causal=False, cu_seq_lens_q=cu_seqlens, ...)
+        # backward needs:
+        #   q/k/v after RoPE, attention output and softmax stats
+        # ----------------------------
+        head_num = query_states.shape[1]
+        softmax_scale = attn.scaling
+        keep_prob = 1 - attn.attention_dropout
+        actual_seq_len = tuple(cu_seqlens[1:].tolist())
+        del cu_seqlens
+
+        attn_result = torch_npu.npu_fusion_attention(
+            query_states,
+            key_states,
+            value_states,
+            head_num,
+            pse=None,
+            atten_mask=None,
+            scale=softmax_scale,
+            keep_prob=keep_prob,
+            input_layout="TND",
+            actual_seq_qlen=actual_seq_len,
+            actual_seq_kvlen=actual_seq_len,
+        )
+        attn_output_tnd = attn_result[0]
+        softmax_max = attn_result[1]
+        softmax_sum = attn_result[2]
+        del attn_result
+
+        # ----------------------------
+        # output projection
+        # origin:
+        #   attn_output = self.proj(attn_output.reshape(seq_length, -1).contiguous())
+        # backward needs:
+        #   proj input
+        # ----------------------------
+        proj_input = attn_output_tnd.reshape(seq_length, -1).contiguous()
+        attn_output = F.linear(
+            proj_input,
+            attn.proj.weight,
+            attn.proj.bias,
+        )
+
+        hidden_states = residual + attn_output
+        del attn_output
+
+        # ============================================================
+        # 3. norm2
+        # origin:
+        #   hidden_states = self.norm2(hidden_states)
+        # backward needs:
+        #   norm2 input, mean, rstd and output
+        # ============================================================
+        residual = hidden_states
+        norm2_input = hidden_states
+
+        hidden_states, norm2_mean, norm2_rstd = torch.native_layer_norm(
+            hidden_states,
+            norm2.normalized_shape,
+            norm2.weight,
+            norm2.bias,
+            norm2.eps,
+        )
+        norm2_output = hidden_states
+
+        # ============================================================
+        # 4. Vision MLP inline
+        # origin:
+        #   hidden_states = self.mlp(hidden_states)
+        # ============================================================
+
+        # ----------------------------
+        # fc1 + GELU
+        # origin:
+        #   hidden_states = self.act_fn(self.linear_fc1(hidden_states))
+        # backward needs:
+        #   fc1 input, fc1 output and activation output
+        # ----------------------------
+        fc1_output = F.linear(
+            hidden_states,
+            mlp.linear_fc1.weight,
+            mlp.linear_fc1.bias,
+        )
+        fc1_activation = F.gelu(fc1_output, approximate="tanh")
+
+        # ----------------------------
+        # fc2
+        # origin:
+        #   hidden_states = self.linear_fc2(hidden_states)
+        # backward needs:
+        #   fc2 input
+        # ----------------------------
+        fc2_output = F.linear(
+            fc1_activation,
+            mlp.linear_fc2.weight,
+            mlp.linear_fc2.bias,
+        )
+
+        # ============================================================
+        # 5. residual add
+        # origin:
+        #   hidden_states = residual + hidden_states
+        # backward needs:
+        #   all intermediate tensors required by the manually fused block
+        # ============================================================
+        hidden_states = residual + fc2_output
+        del fc2_output
+
+        ctx.save_for_backward(
+            norm1_input,
+            norm1_output,
+            norm1_mean,
+            norm1_rstd,
+            query_states_before_rope,
+            key_states_before_rope,
+            value_states,
+            query_states,
+            key_states,
+            cos,
+            sin,
+            attn_output_tnd,
+            softmax_max,
+            softmax_sum,
+            proj_input,
+            norm2_input,
+            norm2_output,
+            norm2_mean,
+            norm2_rstd,
+            fc1_output,
+            fc1_activation,
+        )
+        ctx.norm1 = norm1
+        ctx.attn = attn
+        ctx.norm2 = norm2
+        ctx.mlp = mlp
+        ctx.head_num = head_num
+        ctx.softmax_scale = softmax_scale
+        ctx.keep_prob = keep_prob
+        ctx.actual_seq_len = actual_seq_len
+        return hidden_states
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        (
+            norm1_input,
+            norm1_output,
+            norm1_mean,
+            norm1_rstd,
+            query_states_before_rope,
+            key_states_before_rope,
+            value_states,
+            query_states,
+            key_states,
+            cos,
+            sin,
+            attn_output_tnd,
+            softmax_max,
+            softmax_sum,
+            proj_input,
+            norm2_input,
+            norm2_output,
+            norm2_mean,
+            norm2_rstd,
+            fc1_output,
+            fc1_activation,
+        ) = ctx.saved_tensors
+        if hasattr(ctx, "maybe_clear_saved_tensors"):
+            ctx.maybe_clear_saved_tensors()
+
+        norm1 = ctx.norm1
+        attn = ctx.attn
+        norm2 = ctx.norm2
+        mlp = ctx.mlp
+        layer_cls = Qwen3OmniMoeVisionBigopBlock
+
+        # ============================================================
+        # 5. residual add
+        # origin:
+        #   hidden_states = residual + hidden_states
+        # backward:
+        #   split gradient to residual and MLP branch
+        # ============================================================
+        grad_output = grad_output.contiguous()
+        grad_residual = grad_output
+        grad_mlp_output = grad_output
+        del grad_output
+
+        # ============================================================
+        # 4. Vision MLP inline backward
+        # origin:
+        #   hidden_states = self.mlp(hidden_states)
+        # ============================================================
+
+        # ----------------------------
+        # fc2 backward
+        # origin:
+        #   hidden_states = self.linear_fc2(hidden_states)
+        # ----------------------------
+        grad_fc1_activation, grad_fc2_weight, grad_fc2_bias = layer_cls._linear_backward(
+            grad_mlp_output,
+            fc1_activation,
+            mlp.linear_fc2.weight,
+            mlp.linear_fc2.bias,
+        )
+        del grad_mlp_output, fc1_activation
+
+        # ----------------------------
+        # GELU backward
+        # origin:
+        #   hidden_states = self.act_fn(hidden_states)
+        # ----------------------------
+        grad_fc1_output = torch.ops.aten.gelu_backward(
+            grad_fc1_activation,
+            fc1_output,
+            approximate="tanh",
+        )
+        del grad_fc1_activation, fc1_output
+
+        # ----------------------------
+        # fc1 backward
+        # origin:
+        #   hidden_states = self.linear_fc1(hidden_states)
+        # ----------------------------
+        grad_norm2_output, grad_fc1_weight, grad_fc1_bias = layer_cls._linear_backward(
+            grad_fc1_output,
+            norm2_output,
+            mlp.linear_fc1.weight,
+            mlp.linear_fc1.bias,
+        )
+        del grad_fc1_output, norm2_output
+
+        # ============================================================
+        # 3. norm2 backward
+        # origin:
+        #   hidden_states = self.norm2(hidden_states)
+        # ============================================================
+        grad_norm2_input, grad_norm2_weight, grad_norm2_bias = torch.ops.aten.native_layer_norm_backward(
+            grad_norm2_output.contiguous(),
+            norm2_input,
+            norm2.normalized_shape,
+            norm2_mean,
+            norm2_rstd,
+            norm2.weight,
+            norm2.bias,
+            (
+                True,
+                norm2.weight.requires_grad,
+                norm2.bias is not None and norm2.bias.requires_grad,
+            ),
+        )
+        del grad_norm2_output, norm2_input, norm2_mean, norm2_rstd
+        grad_residual = grad_residual + grad_norm2_input
+        del grad_norm2_input
+
+        # ============================================================
+        # 2. Vision Attention inline backward
+        # origin:
+        #   hidden_states = self.attn(...)
+        # ============================================================
+
+        # ----------------------------
+        # output projection backward
+        # origin:
+        #   attn_output = self.proj(attn_output)
+        # ----------------------------
+        grad_proj_input, grad_proj_weight, grad_proj_bias = layer_cls._linear_backward(
+            grad_residual,
+            proj_input,
+            attn.proj.weight,
+            attn.proj.bias,
+        )
+        del proj_input
+
+        # ----------------------------
+        # non-causal varlen attention backend backward
+        # origin:
+        #   attn_output = torch_npu.npu_fusion_attention(...)[0]
+        # ----------------------------
+        grad_query_states, grad_key_states, grad_value_states, _ = torch_npu.npu_fusion_attention_grad(
+            query_states,
+            key_states,
+            value_states,
+            grad_proj_input.reshape_as(attn_output_tnd).contiguous(),
+            ctx.head_num,
+            input_layout="TND",
+            pse=None,
+            atten_mask=None,
+            softmax_max=softmax_max,
+            softmax_sum=softmax_sum,
+            attention_in=attn_output_tnd,
+            scale_value=ctx.softmax_scale,
+            keep_prob=ctx.keep_prob,
+            actual_seq_qlen=ctx.actual_seq_len,
+            actual_seq_kvlen=ctx.actual_seq_len,
+        )
+        del query_states, key_states, value_states, grad_proj_input, attn_output_tnd, softmax_max, softmax_sum
+
+        # ----------------------------
+        # Vision RoPE backward
+        # origin:
+        #   query_states = torch_npu.npu_rotary_mul(query_states, cos, sin)
+        #   key_states = torch_npu.npu_rotary_mul(key_states, cos, sin)
+        # ----------------------------
+        grad_query_states, _, _ = torch_npu.npu_rotary_mul_backward(
+            grad_query_states.unsqueeze(0),
+            query_states_before_rope.unsqueeze(0),
+            cos,
+            sin,
+        )
+        grad_key_states, _, _ = torch_npu.npu_rotary_mul_backward(
+            grad_key_states.unsqueeze(0),
+            key_states_before_rope.unsqueeze(0),
+            cos,
+            sin,
+        )
+        grad_query_states = grad_query_states.squeeze(0)
+        grad_key_states = grad_key_states.squeeze(0)
+        del query_states_before_rope, key_states_before_rope, cos, sin
+
+        # ----------------------------
+        # qkv projection backward
+        # origin:
+        #   query_states, key_states, value_states = self.qkv(hidden_states).reshape(...).permute(...).unbind(0)
+        # ----------------------------
+        grad_qkv_output = torch.stack(
+            (
+                grad_query_states,
+                grad_key_states,
+                grad_value_states,
+            ),
+            dim=0,
+        )
+        grad_qkv_output = grad_qkv_output.permute(1, 0, 2, 3).reshape(norm1_output.shape[0], -1)
+        del grad_query_states, grad_key_states, grad_value_states
+
+        grad_norm1_output, grad_qkv_weight, grad_qkv_bias = layer_cls._linear_backward(
+            grad_qkv_output,
+            norm1_output,
+            attn.qkv.weight,
+            attn.qkv.bias,
+        )
+        del grad_qkv_output, norm1_output
+
+        # ============================================================
+        # 1. norm1 backward
+        # origin:
+        #   hidden_states = self.norm1(hidden_states)
+        # ============================================================
+        grad_norm1_input, grad_norm1_weight, grad_norm1_bias = torch.ops.aten.native_layer_norm_backward(
+            grad_norm1_output.contiguous(),
+            norm1_input,
+            norm1.normalized_shape,
+            norm1_mean,
+            norm1_rstd,
+            norm1.weight,
+            norm1.bias,
+            (
+                True,
+                norm1.weight.requires_grad,
+                norm1.bias is not None and norm1.bias.requires_grad,
+            ),
+        )
+        del grad_norm1_output, norm1_input, norm1_mean, norm1_rstd
+
+        # ============================================================
+        # 0. first residual add backward
+        # origin:
+        #   hidden_states = residual + attn_output
+        # ============================================================
+        grad_hidden_states = grad_residual + grad_norm1_input
+        del grad_residual, grad_norm1_input
+
+        # ============================================================
+        # Parameter gradient accumulation
+        # origin:
+        #   module parameters are passed through the Function as modules,
+        #   so their gradients are accumulated explicitly.
+        # ============================================================
+        acc = layer_cls._accumulate_grad
+        acc(norm1.weight, grad_norm1_weight)
+        del grad_norm1_weight
+        acc(norm1.bias, grad_norm1_bias)
+        del grad_norm1_bias
+        acc(attn.qkv.weight, grad_qkv_weight)
+        del grad_qkv_weight
+        acc(attn.qkv.bias, grad_qkv_bias)
+        del grad_qkv_bias
+        acc(attn.proj.weight, grad_proj_weight)
+        del grad_proj_weight
+        acc(attn.proj.bias, grad_proj_bias)
+        del grad_proj_bias
+        acc(norm2.weight, grad_norm2_weight)
+        del grad_norm2_weight
+        acc(norm2.bias, grad_norm2_bias)
+        del grad_norm2_bias
+        acc(mlp.linear_fc1.weight, grad_fc1_weight)
+        del grad_fc1_weight
+        acc(mlp.linear_fc1.bias, grad_fc1_bias)
+        del grad_fc1_bias
+        acc(mlp.linear_fc2.weight, grad_fc2_weight)
+        del grad_fc2_weight
+        acc(mlp.linear_fc2.bias, grad_fc2_bias)
+        del grad_fc2_bias
+
+        ctx.norm1 = None
+        ctx.attn = None
+        ctx.norm2 = None
+        ctx.mlp = None
+        ctx.actual_seq_len = None
+
+        return grad_hidden_states, None, None, None, None, None, None, None, None
+
+
 class Qwen3OmniMoeVisionBlock(GradientCheckpointingLayer):
     def __init__(self, config, attn_implementation: str = "sdpa") -> None:
         super().__init__()
@@ -1132,15 +2073,22 @@ class Qwen3OmniMoeVisionBlock(GradientCheckpointingLayer):
         position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
         **kwargs,
     ) -> torch.Tensor:
-        hidden_states = hidden_states + self.attn(
-            self.norm1(hidden_states),
-            cu_seqlens=cu_seqlens,
-            rotary_pos_emb=rotary_pos_emb,
-            position_embeddings=position_embeddings,
-            **kwargs,
+        if position_embeddings is None:
+            raise ValueError("position_embeddings must be provided for the bigop vision block")
+        if cu_seqlens is None:
+            raise ValueError("cu_seqlens must be provided for the bigop vision block")
+
+        return Qwen3OmniMoeVisionBigopBlock.apply(
+            hidden_states,
+            cu_seqlens,
+            rotary_pos_emb,
+            position_embeddings,
+            self.norm1,
+            self.attn,
+            self.norm2,
+            self.mlp,
+            kwargs,
         )
-        hidden_states = hidden_states + self.mlp(self.norm2(hidden_states))
-        return hidden_states
 
 
 class Qwen3OmniMoeVisionPatchEmbed(nn.Module):
@@ -1771,18 +2719,868 @@ class Qwen3OmniMoeThinkerTextMLP(nn.Module):
         return down_proj
 
 
+class Qwen3OmniMoeThinkerTextBigopDecoderLayer(torch.autograd.Function):
+
+    @staticmethod
+    def _accumulate_grad(param, grad):
+        if param is None or grad is None or not param.requires_grad:
+            return
+        grad = grad.to(param.dtype)
+        if param.grad is None:
+            param.grad = grad
+        else:
+            param.grad.add_(grad)
+
+    @staticmethod
+    def _linear_backward(grad_output, input_, weight, bias=None):
+        grad_output_2d = grad_output.reshape(-1, grad_output.shape[-1])
+        input_2d = input_.reshape(-1, input_.shape[-1])
+
+        grad_input = grad_output_2d.matmul(weight).reshape_as(input_)
+        grad_weight = grad_output_2d.t().matmul(input_2d) if weight.requires_grad else None
+        grad_bias = grad_output_2d.sum(dim=0) if bias is not None and bias.requires_grad else None
+        return grad_input, grad_weight, grad_bias
+
+    @staticmethod
+    def _moe_scatter_forward(input_, scatter_index):
+        moe_scatter_logits_layer = torch.classes.xpu_ops.MOEScatterLogits()
+        return moe_scatter_logits_layer.moe_scatter_logits_forward(
+            input_,
+            None,
+            scatter_index,
+            scatter_index.shape[1],
+        )
+
+    @staticmethod
+    def _moe_scatter_backward(expert_output, scatter_index):
+        reverted_output = expert_output[scatter_index.flatten()].reshape(
+            -1,
+            scatter_index.shape[1],
+            expert_output.shape[-1],
+        )
+        return reverted_output.sum(dim=1)
+
+    @staticmethod
+    def forward(
+        ctx,
+        hidden_states,
+        input_layernorm,
+        self_attn,
+        cos,
+        sin,
+        cu_seq_lens_q,
+        cu_seq_lens_k,
+        attn_mask_npu,
+        past_key_values,
+        cache_position,
+        post_attention_layernorm,
+        mlp,
+    ):
+        # ============================================================
+        # 1. input_layernorm
+        # origin:
+        #   hidden_states = self.input_layernorm(hidden_states)
+        # backward needs:
+        #   input_layernorm input and rstd
+        # ============================================================
+        residual = hidden_states
+        input_layernorm_input = hidden_states
+
+        hidden_states, input_layernorm_rstd = torch_npu.npu_rms_norm(
+            hidden_states,
+            input_layernorm.weight,
+            input_layernorm.variance_epsilon,
+        )
+        input_layernorm_output = hidden_states
+
+        # ============================================================
+        # 2. Self Attention inline
+        # origin:
+        #   hidden_states, _ = self.self_attn(...)
+        # ============================================================
+        input_shape = hidden_states.shape[:-1]
+        hidden_shape = (*input_shape, -1, self_attn.head_dim)
+
+        # ----------------------------
+        # q_proj + q_norm
+        # origin:
+        #   query_states = self.q_norm(self.q_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
+        # backward needs:
+        #   q_proj output and q_norm rstd
+        # ----------------------------
+        q_proj_output = self_attn.q_proj(hidden_states).view(hidden_shape)
+        query_states, q_norm_rstd = torch_npu.npu_rms_norm(
+            q_proj_output,
+            self_attn.q_norm.weight,
+            self_attn.q_norm.variance_epsilon,
+        )
+        query_states_before_rope = query_states
+
+        # ----------------------------
+        # k_proj + k_norm
+        # origin:
+        #   key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
+        # backward needs:
+        #   k_proj output and k_norm rstd
+        # ----------------------------
+        k_proj_output = self_attn.k_proj(hidden_states).view(hidden_shape)
+        key_states, k_norm_rstd = torch_npu.npu_rms_norm(
+            k_proj_output,
+            self_attn.k_norm.weight,
+            self_attn.k_norm.variance_epsilon,
+        )
+        key_states_before_rope = key_states
+
+        # ----------------------------
+        # v_proj
+        # origin:
+        #   value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        # ----------------------------
+        value_states = self_attn.v_proj(hidden_states).view(hidden_shape)
+
+        # ----------------------------
+        # RoPE inline
+        # origin:
+        #   query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        # ----------------------------
+        cos = cos.unsqueeze(2)
+        sin = sin.unsqueeze(2)
+        query_states = torch_npu.npu_rotary_mul(query_states, cos, sin)
+        key_states = torch_npu.npu_rotary_mul(key_states, cos, sin)
+
+        # ----------------------------
+        # KV cache
+        # origin:
+        #   key_states, value_states = past_key_values.update(...)
+        # ----------------------------
+        if past_key_values is not None:
+            cache_kwargs = {
+                "sin": sin.squeeze(2),
+                "cos": cos.squeeze(2),
+                "cache_position": cache_position,
+            }
+            key_states, value_states = past_key_values.update(
+                key_states,
+                value_states,
+                self_attn.layer_idx,
+                cache_kwargs,
+            )
+            del cache_kwargs
+
+        # ----------------------------
+        # causal+varlen attention backend
+        # origin:
+        #   attention_interface = ALL_ATTENTION_FUNCTIONS.get_interface(...)
+        #   attn_output, attn_weights = attention_interface(...)
+        # backward needs:
+        #   q/k/v after RoPE, attention output and softmax stats
+        # ----------------------------
+        query_states, key_states, value_states = (
+            x.squeeze(0) for x in (query_states, key_states, value_states)
+        )
+
+        head_num = query_states.shape[1]
+        softmax_scale = query_states.shape[-1]**(-0.5)
+        keep_prob = 1 - self_attn.attention_dropout
+        actual_seq_qlen = tuple(cu_seq_lens_q[1:].tolist())
+        actual_seq_kvlen = tuple(cu_seq_lens_k[1:].tolist())
+
+        attn_result = torch_npu.npu_fusion_attention(
+            query_states,
+            key_states,
+            value_states,
+            head_num,
+            pse=None,
+            atten_mask=attn_mask_npu,
+            scale=softmax_scale,
+            keep_prob=keep_prob,
+            input_layout="TND",
+            actual_seq_qlen=actual_seq_qlen,
+            actual_seq_kvlen=actual_seq_kvlen,
+            sparse_mode=SPARSE_MODE,
+        )
+        attn_output_tnd = attn_result[0]
+        softmax_max = attn_result[1]
+        softmax_sum = attn_result[2]
+        del attn_result
+
+        # ----------------------------
+        # o_proj
+        # origin:
+        #   attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+        #   attn_output = self.o_proj(attn_output)
+        # backward needs:
+        #   o_proj input
+        # ----------------------------
+        o_proj_input = attn_output_tnd.reshape(*input_shape, -1).contiguous()
+        attn_output = self_attn.o_proj(o_proj_input)
+
+        hidden_states = residual + attn_output
+        del attn_output
+
+        # ============================================================
+        # 3. post_attention_layernorm
+        # origin:
+        #   hidden_states = self.post_attention_layernorm(hidden_states)
+        # backward needs:
+        #   post_attention_layernorm input and rstd
+        # ============================================================
+        residual = hidden_states
+        post_layernorm_input = hidden_states
+
+        hidden_states, post_layernorm_rstd = torch_npu.npu_rms_norm(
+            hidden_states,
+            post_attention_layernorm.weight,
+            post_attention_layernorm.variance_epsilon,
+        )
+        post_layernorm_output = hidden_states
+
+        # ============================================================
+        # 4. MLP inline
+        # origin:
+        #   hidden_states = self.mlp(hidden_states)
+        # ============================================================
+
+        # ------------------------------------------------------------
+        # Sparse MoE 分支
+        # according to Qwen3OmniMoeThinkerTextSparseMoeBlock
+        # origin:
+        #   _, routing_weights, selected_experts = self.gate(...)
+        #   final_hidden_states = self.experts(...)
+        # ------------------------------------------------------------
+        gate, experts = mlp.gate, mlp.experts
+        batch_size, sequence_length, hidden_dim = hidden_states.shape
+        hidden_states_reshaped = hidden_states.view(-1, hidden_dim)
+
+        # ----------------------------
+        # 4.1 Router inline
+        # according to Qwen3OmniMoeThinkerTextTopKRouter.forward
+        # backward needs:
+        #   softmax output, top-k values, selected experts and top-k sum
+        # ----------------------------
+        router_scores = F.linear(
+            hidden_states_reshaped,
+            gate.weight,
+        )
+
+        router_probs = torch.nn.functional.softmax(
+            router_scores,
+            dtype=torch.float,
+            dim=-1,
+        )
+        del router_scores
+
+        routing_weights, selected_experts = torch.topk(
+            router_probs,
+            gate.top_k,
+            dim=-1,
+        )
+
+        routing_weights_sum = routing_weights.sum(
+            dim=-1,
+            keepdim=True,
+        )
+
+        if gate.norm_topk_prob:
+            routing_weights = routing_weights / routing_weights_sum
+        else:
+            routing_weights_sum = torch.ones_like(routing_weights_sum)
+
+        routing_weights = routing_weights.to(router_probs.dtype)
+
+        # ----------------------------
+        # 4.2 Experts inline
+        # according to Qwen3OmniMoeThinkerTextExperts.forward
+        # ----------------------------
+        moe_routing_weights = routing_weights.to(hidden_states_reshaped.dtype)
+
+        # ----------------------------
+        # 4.2.1 Expert Histogram
+        # ----------------------------
+        splits = torch.histc(
+            selected_experts.float(), bins=experts.num_experts, min=0.0, max=float(experts.num_experts - 1)
+        ).to(dtype=torch.int32)
+
+        # ----------------------------
+        # 4.2.2 compute the each token's index in result
+        # scatter_index shape (batch_size * sequence_len, topk)
+        # ----------------------------
+        idx_f = selected_experts.flatten().to(torch.float32)  # 1. on-device float
+        scatter_index = idx_f.argsort(stable=True)  # 2. aiCore ArgSort
+        scatter_index = scatter_index.to(torch.float32).argsort()  # 3. aiCore ArgSort
+        scatter_index = scatter_index.int().view(selected_experts.shape)  # 4. back to int
+        del idx_f
+
+        # ----------------------------
+        # 4.2.3 compute the result, select tokens by scatter_index, and put them together
+        # scatter_output shape (batch_size * sequence_len * topk, hidden_size)
+        # ----------------------------
+        moe_scatter_logits_layer = torch.classes.xpu_ops.MOEScatterLogits()
+        scatter_output = moe_scatter_logits_layer.moe_scatter_logits_forward(
+            hidden_states_reshaped, None, scatter_index, scatter_index.shape[1]
+        )
+
+        # ----------------------------
+        # 4.2.4 compute linear layer fc1
+        # cumsum_t = torch.cumsum(splits, dim=0).to(torch.int64)
+        # fc1 = gmm(input, gate_up_proj)
+        # ----------------------------
+        fc1_output = torch.ops.xpu_ops.moe_linear_forward(
+            scatter_output,
+            experts.gate_up_proj,
+            None,  # bias
+            splits,
+            False,  # transpose_input
+            True,  # transpose_weight
+        )
+
+        # ----------------------------
+        # 4.2.5 compute the actication of linear layer fc1
+        # fc1_activation shape is (batch_size * sequence_len * topk, ffn_dim)
+        # ----------------------------
+        fc1_activation = torch_npu.npu_swiglu(fc1_output)
+
+        # ----------------------------
+        # 4.2.6 compute the the weighted linear layer fc1 result
+        # compute scattered_gate_weight, shape is (batch_size * sequence_len * topk)
+        # fc1_weighted_output shape is (batch_size * sequence_len * topk, ffn_dim)
+        # ----------------------------
+        reshaped_gate_weight = moe_routing_weights.reshape(-1, 1)
+        scattered_gate_weight = torch.empty_like(reshaped_gate_weight)
+        scattered_gate_weight[scatter_index.flatten()] = reshaped_gate_weight
+        fc1_weighted_output = fc1_activation * scattered_gate_weight
+        del moe_routing_weights, reshaped_gate_weight
+
+        # ----------------------------
+        # 4.2.7 compute linear layer fc2
+        # fc2_output shape is (batch_size * sequence_len * topk, hidden_size)
+        # ----------------------------
+        fc2_output = torch.ops.xpu_ops.moe_linear_forward(
+            fc1_weighted_output,
+            experts.down_proj,
+            None,  # bias
+            splits,
+            False,  # transpose_input
+            True,  # transpose_weight
+        )
+
+        # ----------------------------
+        # 4.2.8 gather the final token result by averate the the topk token results
+        # ----------------------------
+        _in_range = torch.ones_like(scatter_index, dtype=torch.bool)
+        reverted_output = fc2_output[scatter_index.flatten()].reshape(
+            -1, scatter_index.shape[1], fc2_output.shape[-1]
+        )
+        reverted_output = reverted_output * _in_range.unsqueeze(-1).to(reverted_output.dtype)
+        expert_output = reverted_output.sum(dim=1)
+        del _in_range, reverted_output, fc2_output
+
+        # reshape the output with input shape
+        final_hidden_states = expert_output.reshape(hidden_states_reshaped.shape)
+
+        hidden_states = final_hidden_states.reshape(
+            batch_size,
+            sequence_length,
+            hidden_dim,
+        )
+        del expert_output, final_hidden_states, hidden_states_reshaped
+
+        # ============================================================
+        # 5. residual add
+        # origin:
+        #   hidden_states = residual + hidden_states
+        # backward needs:
+        #   all intermediate tensors required by the manually fused layer
+        # ============================================================
+        hidden_states = residual + hidden_states
+
+        ctx.save_for_backward(
+            input_layernorm_input,
+            input_layernorm_output,
+            input_layernorm_rstd,
+            q_proj_output,
+            query_states_before_rope,
+            q_norm_rstd,
+            k_proj_output,
+            key_states_before_rope,
+            k_norm_rstd,
+            value_states,
+            query_states,
+            key_states,
+            cos,
+            sin,
+            attn_output_tnd,
+            softmax_max,
+            softmax_sum,
+            o_proj_input,
+            post_layernorm_input,
+            post_layernorm_output,
+            post_layernorm_rstd,
+            router_probs,
+            routing_weights,
+            routing_weights_sum,
+            selected_experts,
+            scatter_index,
+            splits,
+            scatter_output,
+            fc1_output,
+            fc1_activation,
+            scattered_gate_weight,
+            fc1_weighted_output,
+        )
+        ctx.input_layernorm = input_layernorm
+        ctx.self_attn = self_attn
+        ctx.post_attention_layernorm = post_attention_layernorm
+        ctx.mlp = mlp
+        ctx.input_shape = input_shape
+        ctx.head_num = head_num
+        ctx.softmax_scale = softmax_scale
+        ctx.keep_prob = keep_prob
+        ctx.attn_mask_npu = attn_mask_npu
+        ctx.actual_seq_qlen = actual_seq_qlen
+        ctx.actual_seq_kvlen = actual_seq_kvlen
+        ctx.norm_topk_prob = gate.norm_topk_prob
+        ctx.has_kv_cache = past_key_values is not None
+        ctx.cache_position = cache_position
+        ctx.current_kv_len = key_states_before_rope.shape[1]
+
+        return hidden_states
+
+    @staticmethod
+    def backward(
+        ctx,
+        grad_output,
+    ):
+        (
+            input_layernorm_input,
+            input_layernorm_output,
+            input_layernorm_rstd,
+            q_proj_output,
+            query_states_before_rope,
+            q_norm_rstd,
+            k_proj_output,
+            key_states_before_rope,
+            k_norm_rstd,
+            value_states,
+            query_states,
+            key_states,
+            cos,
+            sin,
+            attn_output_tnd,
+            softmax_max,
+            softmax_sum,
+            o_proj_input,
+            post_layernorm_input,
+            post_layernorm_output,
+            post_layernorm_rstd,
+            router_probs,
+            routing_weights,
+            routing_weights_sum,
+            selected_experts,
+            scatter_index,
+            splits,
+            scatter_output,
+            fc1_output,
+            fc1_activation,
+            scattered_gate_weight,
+            fc1_weighted_output,
+        ) = ctx.saved_tensors
+        if hasattr(ctx, "maybe_clear_saved_tensors"):
+            ctx.maybe_clear_saved_tensors()
+
+        input_layernorm = ctx.input_layernorm
+        self_attn = ctx.self_attn
+        post_attention_layernorm = ctx.post_attention_layernorm
+        mlp = ctx.mlp
+        gate, experts = mlp.gate, mlp.experts
+        layer_cls = Qwen3OmniMoeThinkerTextBigopDecoderLayer
+
+        # ============================================================
+        # 5. residual add
+        # origin:
+        #   hidden_states = residual + hidden_states
+        # backward:
+        #   split gradient to residual and MLP branch
+        # ============================================================
+        grad_output = grad_output.contiguous()
+        grad_residual = grad_output
+        grad_mlp_output = grad_output.reshape(-1, grad_output.shape[-1])
+
+        # ============================================================
+        # 4. MLP inline backward
+        # origin:
+        #   hidden_states = self.mlp(hidden_states)
+        # ============================================================
+
+        # ------------------------------------------------------------
+        # Sparse MoE branch backward
+        # according to Qwen3OmniMoeThinkerTextSparseMoeBlock
+        # origin:
+        #   _, routing_weights, selected_experts = self.gate(...)
+        #   final_hidden_states = self.experts(...)
+        # ------------------------------------------------------------
+
+        # ----------------------------
+        # 4.2.8 gather backward
+        # origin:
+        #   expert_output = reverted_output.sum(dim=1)
+        # ----------------------------
+        grad_fc2_output = layer_cls._moe_scatter_forward(
+            grad_mlp_output,
+            scatter_index,
+        )
+        del grad_mlp_output
+
+        # ----------------------------
+        # 4.2.7 fc2 backward
+        # origin:
+        #   fc2_output = moe_linear_forward(fc1_weighted_output, down_proj, ...)
+        # ----------------------------
+        grad_fc1_weighted_output = torch.ops.xpu_ops.moe_linear_forward(
+            grad_fc2_output,
+            experts.down_proj,
+            None,
+            splits,
+            False,
+            False,
+        )
+        grad_down_proj = None
+        if experts.down_proj.requires_grad:
+            grad_down_proj = torch.ops.xpu_ops.moe_linear_backward(
+                grad_fc2_output,
+                fc1_weighted_output,
+                None,
+                splits,
+                True,
+                False,
+            )
+        del grad_fc2_output, fc1_weighted_output
+
+        # ----------------------------
+        # 4.2.6 routing weight multiply backward
+        # origin:
+        #   fc1_weighted_output = fc1_activation * scattered_gate_weight
+        # ----------------------------
+        grad_fc1_activation = grad_fc1_weighted_output * scattered_gate_weight
+        grad_scattered_gate_weight = torch.sum(
+            fc1_activation * grad_fc1_weighted_output,
+            dim=-1,
+            keepdim=True,
+        )
+        grad_routing_weights = grad_scattered_gate_weight[scatter_index.flatten()].reshape_as(routing_weights)
+        grad_routing_weights = grad_routing_weights.to(router_probs.dtype)
+        del fc1_activation, scattered_gate_weight, grad_fc1_weighted_output, grad_scattered_gate_weight
+
+        # ----------------------------
+        # 4.2.5 swiglu backward
+        # origin:
+        #   fc1_activation = torch_npu.npu_swiglu(fc1_output)
+        # ----------------------------
+        grad_fc1_output = torch_npu.npu_swiglu_backward(
+            grad_fc1_activation,
+            fc1_output,
+        )
+        del grad_fc1_activation, fc1_output
+
+        # ----------------------------
+        # 4.2.4 fc1 backward
+        # origin:
+        #   fc1_output = moe_linear_forward(scatter_output, gate_up_proj, ...)
+        # ----------------------------
+        grad_scatter_output = torch.ops.xpu_ops.moe_linear_forward(
+            grad_fc1_output,
+            experts.gate_up_proj,
+            None,
+            splits,
+            False,
+            False,
+        )
+        grad_gate_up_proj = None
+        if experts.gate_up_proj.requires_grad:
+            grad_gate_up_proj = torch.ops.xpu_ops.moe_linear_backward(
+                grad_fc1_output,
+                scatter_output,
+                None,
+                splits,
+                True,
+                False,
+            )
+        del grad_fc1_output, scatter_output, splits
+
+        # ----------------------------
+        # 4.2.3 scatter backward
+        # origin:
+        #   scatter_output = moe_scatter_logits_forward(hidden_states_reshaped, ...)
+        # ----------------------------
+        grad_mlp_input = layer_cls._moe_scatter_backward(
+            grad_scatter_output,
+            scatter_index,
+        ).reshape_as(post_layernorm_output)
+        del grad_scatter_output, scatter_index
+
+        # ----------------------------
+        # 4.1 Router backward
+        # origin:
+        #   router_probs = softmax(F.linear(hidden_states_reshaped, gate.weight))
+        #   routing_weights, selected_experts = torch.topk(router_probs, ...)
+        # ----------------------------
+        if ctx.norm_topk_prob:
+            correction = torch.sum(grad_routing_weights * routing_weights, dim=-1, keepdim=True)
+            grad_routing_weights = (grad_routing_weights - correction) / routing_weights_sum
+            del correction
+        del routing_weights, routing_weights_sum
+
+        grad_router_probs = torch.zeros_like(router_probs)
+        grad_router_probs.scatter_add_(1, selected_experts, grad_routing_weights)
+        del selected_experts, grad_routing_weights
+
+        grad_router_scores = router_probs * (
+            grad_router_probs - torch.sum(grad_router_probs * router_probs, dim=-1, keepdim=True)
+        )
+        del grad_router_probs, router_probs
+        post_layernorm_output_2d = post_layernorm_output.reshape(-1, post_layernorm_output.shape[-1])
+        grad_gate_weight = None
+        if gate.weight.requires_grad:
+            grad_gate_weight = grad_router_scores.t().matmul(
+                post_layernorm_output_2d.to(grad_router_scores.dtype)
+            )
+        del post_layernorm_output_2d
+        grad_router_input = grad_router_scores.matmul(
+            gate.weight.to(grad_router_scores.dtype)
+        ).reshape_as(post_layernorm_output)
+        grad_router_input = grad_router_input.to(post_layernorm_output.dtype)
+        del grad_router_scores, post_layernorm_output
+
+        grad_post_layernorm_output = grad_mlp_input + grad_router_input
+        del grad_mlp_input, grad_router_input
+
+        # ============================================================
+        # 3. post_attention_layernorm backward
+        # origin:
+        #   hidden_states = self.post_attention_layernorm(hidden_states)
+        # ============================================================
+        grad_post_layernorm_input, grad_post_layernorm_weight = torch_npu.npu_rms_norm_backward(
+            grad_post_layernorm_output.contiguous(),
+            post_layernorm_input,
+            post_attention_layernorm.weight,
+            post_layernorm_rstd,
+        )
+        del grad_post_layernorm_output, post_layernorm_input, post_layernorm_rstd
+        grad_residual = grad_residual + grad_post_layernorm_input
+        del grad_post_layernorm_input
+
+        # ============================================================
+        # 2. Self Attention inline backward
+        # origin:
+        #   hidden_states, _ = self.self_attn(...)
+        # ============================================================
+
+        # ----------------------------
+        # o_proj backward
+        # origin:
+        #   attn_output = self.o_proj(attn_output)
+        # ----------------------------
+        grad_o_proj_input, grad_o_proj_weight, grad_o_proj_bias = layer_cls._linear_backward(
+            grad_residual,
+            o_proj_input,
+            self_attn.o_proj.weight,
+            self_attn.o_proj.bias,
+        )
+        del o_proj_input
+
+        # ----------------------------
+        # causal+varlen attention backend backward
+        # origin:
+        #   attn_output = torch_npu.npu_fusion_attention(...)[0]
+        # ----------------------------
+        grad_query_states, grad_key_states, grad_value_states, _ = torch_npu.npu_fusion_attention_grad(
+            query_states,
+            key_states,
+            value_states,
+            grad_o_proj_input.reshape_as(attn_output_tnd).contiguous(),
+            ctx.head_num,
+            input_layout="TND",
+            pse=None,
+            atten_mask=ctx.attn_mask_npu,
+            softmax_max=softmax_max,
+            softmax_sum=softmax_sum,
+            attention_in=attn_output_tnd,
+            scale_value=ctx.softmax_scale,
+            keep_prob=ctx.keep_prob,
+            actual_seq_qlen=ctx.actual_seq_qlen,
+            actual_seq_kvlen=ctx.actual_seq_kvlen,
+            sparse_mode=SPARSE_MODE,
+        )
+        del query_states, key_states, value_states, grad_o_proj_input, attn_output_tnd, softmax_max, softmax_sum
+        ctx.attn_mask_npu = None
+
+        if ctx.has_kv_cache:
+            if ctx.cache_position is not None:
+                cache_position = ctx.cache_position.to(device=grad_key_states.device, dtype=torch.long)
+                grad_key_states = grad_key_states.index_select(0, cache_position)
+                grad_value_states = grad_value_states.index_select(0, cache_position)
+                del cache_position
+            else:
+                grad_key_states = grad_key_states[-ctx.current_kv_len :]
+                grad_value_states = grad_value_states[-ctx.current_kv_len :]
+        ctx.cache_position = None
+
+        # ----------------------------
+        # RoPE backward
+        # origin:
+        #   query_states = torch_npu.npu_rotary_mul(query_states, cos, sin)
+        #   key_states = torch_npu.npu_rotary_mul(key_states, cos, sin)
+        # ----------------------------
+        grad_query_states, _, _ = torch_npu.npu_rotary_mul_backward(
+            grad_query_states.unsqueeze(0),
+            query_states_before_rope,
+            cos,
+            sin,
+        )
+        grad_key_states, _, _ = torch_npu.npu_rotary_mul_backward(
+            grad_key_states.unsqueeze(0),
+            key_states_before_rope,
+            cos,
+            sin,
+        )
+        del query_states_before_rope, key_states_before_rope, cos, sin
+
+        # ----------------------------
+        # q_norm / k_norm backward
+        # origin:
+        #   query_states = self.q_norm(q_proj_output)
+        #   key_states = self.k_norm(k_proj_output)
+        # ----------------------------
+        grad_q_proj_output, grad_q_norm_weight = torch_npu.npu_rms_norm_backward(
+            grad_query_states.contiguous(),
+            q_proj_output,
+            self_attn.q_norm.weight,
+            q_norm_rstd,
+        )
+        del grad_query_states, q_proj_output, q_norm_rstd
+        grad_k_proj_output, grad_k_norm_weight = torch_npu.npu_rms_norm_backward(
+            grad_key_states.contiguous(),
+            k_proj_output,
+            self_attn.k_norm.weight,
+            k_norm_rstd,
+        )
+        del grad_key_states, k_proj_output, k_norm_rstd
+
+        # ----------------------------
+        # q_proj / k_proj / v_proj backward
+        # origin:
+        #   query_states = self.q_proj(hidden_states)
+        #   key_states = self.k_proj(hidden_states)
+        #   value_states = self.v_proj(hidden_states)
+        # ----------------------------
+        grad_q_proj_output = grad_q_proj_output.reshape(*ctx.input_shape, -1)
+        grad_k_proj_output = grad_k_proj_output.reshape(*ctx.input_shape, -1)
+        grad_v_proj_output = grad_value_states.unsqueeze(0).reshape(*ctx.input_shape, -1)
+        del grad_value_states
+
+        grad_q_input, grad_q_proj_weight, grad_q_proj_bias = layer_cls._linear_backward(
+            grad_q_proj_output,
+            input_layernorm_output,
+            self_attn.q_proj.weight,
+            self_attn.q_proj.bias,
+        )
+        del grad_q_proj_output
+        grad_k_input, grad_k_proj_weight, grad_k_proj_bias = layer_cls._linear_backward(
+            grad_k_proj_output,
+            input_layernorm_output,
+            self_attn.k_proj.weight,
+            self_attn.k_proj.bias,
+        )
+        del grad_k_proj_output
+        grad_v_input, grad_v_proj_weight, grad_v_proj_bias = layer_cls._linear_backward(
+            grad_v_proj_output,
+            input_layernorm_output,
+            self_attn.v_proj.weight,
+            self_attn.v_proj.bias,
+        )
+        del grad_v_proj_output, input_layernorm_output
+        grad_input_layernorm_output = grad_q_input + grad_k_input + grad_v_input
+        del grad_q_input, grad_k_input, grad_v_input
+
+        # ============================================================
+        # 1. input_layernorm backward
+        # origin:
+        #   hidden_states = self.input_layernorm(hidden_states)
+        # ============================================================
+        grad_input_layernorm_input, grad_input_layernorm_weight = torch_npu.npu_rms_norm_backward(
+            grad_input_layernorm_output.contiguous(),
+            input_layernorm_input,
+            input_layernorm.weight,
+            input_layernorm_rstd,
+        )
+        del grad_input_layernorm_output, input_layernorm_input, input_layernorm_rstd
+
+        # ============================================================
+        # 0. first residual add backward
+        # origin:
+        #   hidden_states = residual + attn_output
+        # ============================================================
+        grad_hidden_states = grad_residual + grad_input_layernorm_input
+        del grad_residual, grad_input_layernorm_input
+
+        # ============================================================
+        # Parameter gradient accumulation
+        # origin:
+        #   module parameters are passed through the Function as modules,
+        #   so their gradients are accumulated explicitly.
+        # ============================================================
+        acc = layer_cls._accumulate_grad
+        acc(input_layernorm.weight, grad_input_layernorm_weight)
+        del grad_input_layernorm_weight
+        acc(self_attn.q_proj.weight, grad_q_proj_weight)
+        del grad_q_proj_weight
+        acc(self_attn.q_proj.bias, grad_q_proj_bias)
+        del grad_q_proj_bias
+        acc(self_attn.k_proj.weight, grad_k_proj_weight)
+        del grad_k_proj_weight
+        acc(self_attn.k_proj.bias, grad_k_proj_bias)
+        del grad_k_proj_bias
+        acc(self_attn.v_proj.weight, grad_v_proj_weight)
+        del grad_v_proj_weight
+        acc(self_attn.v_proj.bias, grad_v_proj_bias)
+        del grad_v_proj_bias
+        acc(self_attn.o_proj.weight, grad_o_proj_weight)
+        del grad_o_proj_weight
+        acc(self_attn.o_proj.bias, grad_o_proj_bias)
+        del grad_o_proj_bias
+        acc(self_attn.q_norm.weight, grad_q_norm_weight)
+        del grad_q_norm_weight
+        acc(self_attn.k_norm.weight, grad_k_norm_weight)
+        del grad_k_norm_weight
+        acc(post_attention_layernorm.weight, grad_post_layernorm_weight)
+        del grad_post_layernorm_weight
+        acc(gate.weight, grad_gate_weight)
+        del grad_gate_weight
+        acc(experts.gate_up_proj, grad_gate_up_proj)
+        del grad_gate_up_proj
+        acc(experts.down_proj, grad_down_proj)
+        del grad_down_proj
+
+        return grad_hidden_states, None, None, None, None, None, None, None, None, None, None, None
+
+
 class Qwen3OmniMoeThinkerTextDecoderLayer(GradientCheckpointingLayer):
     def __init__(self, config, layer_idx):
         super().__init__()
+
+        # 保持原来的 module 结构，避免 state_dict key 改变
         self.self_attn = Qwen3OmniMoeThinkerTextAttention(config, layer_idx)
-        if (layer_idx not in config.mlp_only_layers) and (
-            config.num_experts > 0 and (layer_idx + 1) % config.decoder_sparse_step == 0
-        ):
-            self.mlp = Qwen3OmniMoeThinkerTextSparseMoeBlock(config)
-        else:
-            self.mlp = Qwen3OmniMoeThinkerTextMLP(config, intermediate_size=config.intermediate_size)
-        self.input_layernorm = Qwen3OmniMoeThinkerTextRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = Qwen3OmniMoeThinkerTextRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+        self.mlp = Qwen3OmniMoeThinkerTextSparseMoeBlock(config)
+
+        self.input_layernorm = Qwen3OmniMoeThinkerTextRMSNorm(
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+        )
+        self.post_attention_layernorm = Qwen3OmniMoeThinkerTextRMSNorm(
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+        )
         self.hidden_size = config.hidden_size
 
     def forward(
@@ -1796,27 +3594,37 @@ class Qwen3OmniMoeThinkerTextDecoderLayer(GradientCheckpointingLayer):
         position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> torch.Tensor:
-        residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
-        # Self Attention
-        hidden_states, _ = self.self_attn(
-            hidden_states=hidden_states,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            use_cache=use_cache,
-            cache_position=cache_position,
-            position_embeddings=position_embeddings,
-            **kwargs,
-        )
-        hidden_states = residual + hidden_states
+        # ============================================================
+        # 0. Bigop fused decoder layer
+        # origin:
+        #   hidden_states = residual + self.mlp(...)
+        # cache:
+        #   Qwen3OmniMoeThinkerTextBigopDecoderLayer handles past_key_values.update(...)
+        # ============================================================
+        if position_embeddings is None:
+            raise ValueError("position_embeddings must be provided for the bigop decoder layer")
 
-        # Fully Connected
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
-        hidden_states = residual + hidden_states
-        return hidden_states
+        cu_seq_lens_q = kwargs.get("cu_seq_lens_q", None)
+        cu_seq_lens_k = kwargs.get("cu_seq_lens_k", None)
+        if cu_seq_lens_q is None or cu_seq_lens_k is None:
+            raise ValueError("cu_seq_lens_q and cu_seq_lens_k must be provided for the bigop decoder layer")
+
+        cos, sin = position_embeddings
+        attn_mask_npu = get_attn_mask_npu(hidden_states.device)
+        return Qwen3OmniMoeThinkerTextBigopDecoderLayer.apply(
+            hidden_states,
+            self.input_layernorm,
+            self.self_attn,
+            cos,
+            sin,
+            cu_seq_lens_q,
+            cu_seq_lens_k,
+            attn_mask_npu,
+            past_key_values,
+            cache_position,
+            self.post_attention_layernorm,
+            self.mlp,
+        )
 
 
 @auto_docstring
@@ -2475,9 +4283,7 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
                 rank_image_mask = image_mask_1d[:, rank_start:rank_end]
                 offset = image_mask_1d[:, :rank_start].sum().item()
                 num_visual_tokens = rank_image_mask.sum().item()
-                deepstack_image_embeds = [
-                    embed[offset : offset + num_visual_tokens] for embed in deepstack_image_embeds
-                ]
+                deepstack_image_embeds = [embed[offset : offset + num_visual_tokens] for embed in deepstack_image_embeds]
 
             if pixel_values_videos is not None:
                 deepstack_video_embeds = [
@@ -2491,9 +4297,7 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
                 rank_video_mask = video_mask_1d[:, rank_start:rank_end]
                 offset = video_mask_1d[:, :rank_start].sum().item()
                 num_visual_tokens = rank_video_mask.sum().item()
-                deepstack_video_embeds = [
-                    embed[offset : offset + num_visual_tokens] for embed in deepstack_video_embeds
-                ]
+                deepstack_video_embeds = [embed[offset : offset + num_visual_tokens] for embed in deepstack_video_embeds]
             # --- Patch.7 ---
         # --- Patch.6 ---
 
@@ -3052,7 +4856,6 @@ class Qwen3OmniMoeForConditionalGeneration(Qwen3OmniMoePreTrainedModel, Generati
         from ..parallel_plan import get_parallel_plan as _get_parallel_plan
 
         return _get_parallel_plan()
-
 
 __all__ = [
     "Qwen3OmniMoeForConditionalGeneration",

@@ -33,27 +33,28 @@ python -m veomni.patchgen.run_codegen veomni.models.transformers.qwen3_omni_moe.
 """
 
 import torch
+
 from veomni.patchgen.patch_spec import PatchConfig
 
 from .qwen3_omni_moe_gpu_patch_gen_config import (
-    qwen3_omni_moe_pretrained_init_weights_patched,
-    qwen3_omni_moe_get_rope_index_patched,
-    qwen3_omni_moe_vision_attention_forward_patched,
-    qwen3_omni_moe_vision_forward_patched,
-    qwen3_omni_moe_vision_dummy_forward_patched,
-    qwen3_omni_moe_audio_forward_patched,
-    qwen3_omni_moe_audio_dummy_forward_patched,
-    qwen3_omni_moe_thinker_text_model_forward_patched,
-    qwen3_omni_moe_thinker_text_deepstack_process_patched,
     PatchedQwen3OmniMoeThinkerTextExperts,
-    qwen3_omni_moe_thinker_get_audio_features_patched,
-    qwen3_omni_moe_thinker_get_position_id_func_patched,
-    qwen3_omni_moe_thinker_forward_patched,
-    qwen3_omni_moe_for_conditional_generation_init_patched,
+    qwen3_omni_moe_audio_dummy_forward_patched,
+    qwen3_omni_moe_audio_forward_patched,
     qwen3_omni_moe_enable_talker_patched,
     qwen3_omni_moe_for_conditional_generation_forward_patched,
-    qwen3_omni_moe_top_get_position_id_func_patched,
+    qwen3_omni_moe_for_conditional_generation_init_patched,
     qwen3_omni_moe_get_parallel_plan_patched,
+    qwen3_omni_moe_get_rope_index_patched,
+    qwen3_omni_moe_pretrained_init_weights_patched,
+    qwen3_omni_moe_thinker_forward_patched,
+    qwen3_omni_moe_thinker_get_audio_features_patched,
+    qwen3_omni_moe_thinker_get_position_id_func_patched,
+    qwen3_omni_moe_thinker_text_deepstack_process_patched,
+    qwen3_omni_moe_thinker_text_model_forward_patched,
+    qwen3_omni_moe_top_get_position_id_func_patched,
+    qwen3_omni_moe_vision_attention_forward_patched,
+    qwen3_omni_moe_vision_dummy_forward_patched,
+    qwen3_omni_moe_vision_forward_patched,
 )
 
 

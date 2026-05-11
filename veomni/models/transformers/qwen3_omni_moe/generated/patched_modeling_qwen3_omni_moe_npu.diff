@@ -72,7 +72,7 @@
 -# See the License for the specific language governing permissions and
 -# limitations under the License.
 +# ==============================================================================
- 
+
  import math
  from collections.abc import Callable
  from dataclasses import dataclass
@@ -168,13 +168,13 @@
 +    assert len(position_ids.shape) == 3 and position_ids.shape[1] == 1
 +    assert len(rope_deltas.shape) == 2 and rope_deltas.shape[0] == 1
 +    return {"position_ids": position_ids.squeeze(1), "rope_deltas": rope_deltas.squeeze(0)}
- 
- 
+
+
  @dataclass
 @@ -106,6 +139,12 @@
          return self.positional_embedding[:seqlen, :]
- 
- 
+
+
 +# ======================================================================
 +# [MODIFIED CLASS] Qwen3OmniMoePreTrainedModel
 +# Methods patched: _init_weights
@@ -187,7 +187,7 @@
 @@ -119,27 +158,35 @@
      _can_compile_fullgraph = False
      _supports_attention_backend = True
- 
+
 +    # ================================================================
 +    # Patch: Qwen3OmniMoePreTrainedModel._init_weights
 +    # Upstream branches on `isinstance(module, Qwen3OmniMoeCode2Wav)`; that
@@ -232,8 +232,8 @@
              inv_freq = 1.0 / (module.theta ** (torch.arange(0, module.dim, 2, dtype=torch.float) / module.dim))
 -            init.copy_(module.inv_freq, inv_freq)
 +            init.copy_(module.inv_freq, inv_freq)  # noqa: F821
- 
- 
+
+
  def _get_feat_extract_output_lengths(input_lengths):
 @@ -151,6 +198,12 @@
      feat_lengths = (input_lengths_leave - 1) // 2 + 1
@@ -245,13 +245,13 @@
 +# [MODIFIED CLASS] Qwen3OmniMoePreTrainedModelForConditionalGeneration
 +# Methods patched: get_rope_index
 +# ======================================================================
- 
- 
+
+
  class Qwen3OmniMoePreTrainedModelForConditionalGeneration(Qwen3OmniMoePreTrainedModel):
 @@ -213,73 +266,27 @@
- 
+
          return list(_iter())
- 
+
 +    # ================================================================
 +    # Patch: Qwen3OmniMoePreTrainedModelForConditionalGeneration.get_rope_index
 +    # 1. [PosID] support interleaved video-with-audio vs video-without-audio in
@@ -426,7 +426,7 @@
 @@ -356,8 +375,8 @@
                          audio_idx += 1
                          remain_audios -= 1
- 
+
 -                    # Image Only
 -                    elif min_ed == ed_vision_start and input_ids[ed_vision_start + 1] == image_token_id:
 +                    # Image only
@@ -437,7 +437,7 @@
 @@ -372,65 +391,73 @@
                          image_idx += 1
                          remain_images -= 1
- 
+
 -                    # Video Only
 -                    elif min_ed == ed_vision_start and input_ids[ed_vision_start + 1] == video_token_id:
 -                        grid_t = video_grid_thw[video_idx][0]
@@ -564,20 +564,20 @@
 +
                      st_idx = llm_pos_ids_list[-1].max() + 1 if len(llm_pos_ids_list) > 0 else 0
                      llm_pos_ids_list.append(torch.arange(eos_len).view(1, -1).expand(3, -1) + st_idx)
- 
+
 @@ -442,7 +469,7 @@
                  llm_positions = torch.cat([item.float() for item in llm_pos_ids_list], dim=1).reshape(3, -1)
- 
+
                  position_ids[..., i, attention_mask[i] == 1] = llm_positions.to(position_ids.device)
 -                mrope_position_deltas.append(llm_positions.max() + 1 - len(input_ids))
 +                mrope_position_deltas.append(llm_positions.max() + 1 - len(input_ids_i))
              mrope_position_deltas = torch.tensor(mrope_position_deltas, device=input_ids.device).unsqueeze(1)
- 
+
              return position_ids, mrope_position_deltas
 @@ -619,6 +646,12 @@
          return outputs
- 
- 
+
+
 +# ======================================================================
 +# [MODIFIED CLASS] Qwen3OmniMoeAudioEncoder
 +# Methods patched: forward, dummy_forward
@@ -590,7 +590,7 @@
 @@ -695,6 +728,14 @@
              attention_mask[..., cu_seqlens[i - 1] : cu_seqlens[i], cu_seqlens[i - 1] : cu_seqlens[i]] = 0
          return attention_mask
- 
+
 +    # ================================================================
 +    # Patch: Qwen3OmniMoeAudioEncoder.forward
 +    # 1. [data] VeOmni ships input_features as (len, num_mel_bins); permute to
@@ -618,7 +618,7 @@
 +
          aftercnn_lens = _get_feat_extract_output_lengths(feature_lens)
          chunk_num = torch.ceil(feature_lens / (self.n_window * 2)).long()
- 
+
 @@ -718,6 +757,15 @@
          tail_chunk_index = F.pad(chunk_num, (1, 0), value=-1).cumsum(0)[1:]
          chunk_lengths[tail_chunk_index] = feature_lens % (self.n_window * 2)
@@ -632,7 +632,7 @@
 +            if sp_input_padding > 0:
 +                input_features = unpad_tensor(input_features, dim=1, padding_size=sp_input_padding)
 +        # --- Patch.2 ---
- 
+
          chunk_list = input_features.T.split(chunk_lengths.tolist(), dim=0)
          padded_feature = nn.utils.rnn.pad_sequence(chunk_list, batch_first=True).transpose(1, 2)
 @@ -727,7 +775,6 @@
@@ -645,7 +645,7 @@
              padded_embed = F.gelu(self.conv2d1(chunk))
 @@ -739,9 +786,7 @@
          padded_embed = self.conv_out(padded_embed.permute(0, 3, 1, 2).contiguous().view(b, t, c * f))
- 
+
          positional_embedding = (
 -            self.positional_embedding.positional_embedding[: padded_embed.shape[1], :]
 -            .unsqueeze(0)
@@ -657,7 +657,7 @@
 @@ -754,12 +799,20 @@
                  cu_chunk_lens += [remainder]
          cu_seqlens = torch.tensor(cu_chunk_lens, device=aftercnn_lens.device).cumsum(-1, dtype=torch.int32)
- 
+
 +        # --- Patch.3 ---
 +        if get_parallel_state().sp_enabled:
 +            unpadded_hidden_len = cu_seqlens[-1]
@@ -674,12 +674,12 @@
              )
 -
              hidden_states = layer_outputs[0]
- 
+
          hidden_states = self.ln_post(hidden_states)
 @@ -815,6 +868,26 @@
          output_lengths = (input_lengths - 2) // 2 + 1
          return input_lengths, output_lengths
- 
+
 +    # ================================================================
 +    # Patch: Qwen3OmniMoeAudioEncoder.dummy_forward (NEW method)
 +    # [FSDP] Synthetic forward so reduce-scatter stays in sync on ranks with
@@ -700,13 +700,13 @@
 +        feature_lens = torch.tensor([min_len], dtype=torch.long, device=self.device)
 +        return self(input_features=input_features, feature_lens=feature_lens)
 +
- 
+
  def rotate_half(x):
      """Rotates half the hidden dims of the input."""
 @@ -823,18 +896,27 @@
      return torch.cat((-x2, x1), dim=-1)
- 
- 
+
+
 +# ======================================================================
 +# [PATCHED FUNCTION] apply_rotary_pos_emb_vision
 +# Reason: Use fused rope to impl rotary postion embedding in vit
@@ -736,13 +736,13 @@
 +# [MODIFIED CLASS] Qwen3OmniMoeVisionAttention
 +# Methods patched: forward
 +# ======================================================================
- 
- 
+
+
  class Qwen3OmniMoeVisionAttention(nn.Module):
 @@ -851,12 +933,20 @@
          self.attention_dropout = 0.0
          self.is_causal = False
- 
+
 +    # ================================================================
 +    # Patch: Qwen3OmniMoeVisionAttention.forward
 +    # 1. [SP] Dispatch via VARLEN_ATTENTION_TYPES (covers veomni_flash_attention_*
@@ -765,7 +765,7 @@
 @@ -870,12 +960,12 @@
          key_states = key_states.transpose(0, 1).unsqueeze(0)
          value_states = value_states.transpose(0, 1).unsqueeze(0)
- 
+
 -        attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
 -            self.config._attn_implementation, eager_attention_forward
 -        )
@@ -800,13 +800,13 @@
              ]
              attn_output = torch.cat(attn_outputs, dim=1)
 +        # --- Patch.1 ---
- 
+
          attn_output = attn_output.reshape(seq_length, -1).contiguous()
          attn_output = self.proj(attn_output)
 @@ -1038,6 +1125,12 @@
          return hidden_states
- 
- 
+
+
 +# ======================================================================
 +# [MODIFIED CLASS] Qwen3OmniMoeVisionEncoder
 +# Methods patched: forward, dummy_forward
@@ -819,7 +819,7 @@
 @@ -1187,43 +1280,67 @@
          patch_pos_embeds = torch.cat(patch_pos_embeds_permute)
          return patch_pos_embeds
- 
+
 +    # ================================================================
 +    # Patch: Qwen3OmniMoeVisionEncoder.forward
 +    # 1. [SP] Slice pos_embeds and rotary cos/sin to match the SP-sharded
@@ -850,7 +850,7 @@
 -            `torch.Tensor`: hidden_states.
 -        """
          hidden_states = self.patch_embed(hidden_states)
- 
+
          pos_embeds = self.fast_pos_embed_interpolate(grid_thw)
 +
 +        sp_group = get_parallel_state().sp_group if get_parallel_state().sp_enabled else None
@@ -860,7 +860,7 @@
 +            pos_embeds = sp_pad_and_slice(pos_embeds, dim=0, pad_value=0, pad_scale=4)
 +        # --- Patch.1 ---
          hidden_states = hidden_states + pos_embeds
- 
+
 +        cu_seqlens = torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]).cumsum(
 +            dim=0,
 +            dtype=grid_thw.dtype if torch.jit.is_tracing() else torch.int32,
@@ -877,7 +877,7 @@
 +        rotary_pos_emb = rotary_pos_emb.reshape(total_seq_len, -1)
          emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
          position_embeddings = (emb.cos(), emb.sin())
- 
+
 -        cu_seqlens = torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]).cumsum(
 -            dim=0,
 -            # Select dtype based on the following factors:
@@ -903,13 +903,13 @@
 +                new_cumsum = cu_seqlens[-1] + pad_seq_len
 +                cu_seqlens = torch.cat([cu_seqlens, new_cumsum.unsqueeze(0)], dim=0)
 +        # --- Patch.2 ---
- 
+
          deepstack_feature_lists = []
          for layer_num, blk in enumerate(self.blocks):
 @@ -1239,17 +1356,37 @@
                  )
                  deepstack_feature_lists.append(deepstack_feature)
- 
+
 +        # --- Patch.3 ---
          merged_hidden_states = self.merger(hidden_states)
 -
@@ -919,7 +919,7 @@
              deepstack_features=deepstack_feature_lists,
          )
 +        # --- Patch.3 ---
- 
+
      @property
      def deepstack_merger_list(self):
          return self.merger_list
@@ -942,13 +942,13 @@
 +            pixel_values = torch.zeros((16, 3 * 2 * 16 * 16), dtype=dtype, device=self.device)
 +            grid_thw = torch.tensor([[1, 4, 4]], dtype=torch.int32, device=self.device)
 +        return self(hidden_states=pixel_values, grid_thw=grid_thw)
- 
- 
+
+
  class Qwen3OmniMoeThinkerTextRotaryEmbedding(nn.Module):
 @@ -1341,13 +1478,24 @@
          return freqs_t
- 
- 
+
+
 -@use_experts_implementation
 +# ======================================================================
 +# [PATCHED CLASS] Qwen3OmniMoeThinkerTextExperts
@@ -983,7 +983,7 @@
 +        # --- Patch.2 ---
 +        self._moe_implementation = getattr(config, "_moe_implementation", "eager")
 +        # --- Patch.2 ---
- 
+
      def forward(
          self,
 @@ -1363,22 +1514,38 @@
@@ -1038,13 +1038,13 @@
 +        else:
 +            raise ValueError(f"Invalid moe implementation: {self._moe_implementation}")
 +        # --- Patch.2 ---
- 
+
          return final_hidden_states
- 
+
 @@ -1418,6 +1585,12 @@
          return final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
- 
- 
+
+
 +# ======================================================================
 +# [MODIFIED CLASS] Qwen3OmniMoeThinkerTextRMSNorm
 +# Methods patched: forward
@@ -1056,7 +1056,7 @@
      def __init__(self, hidden_size, eps: float = 1e-6) -> None:
 @@ -1429,17 +1602,17 @@
          self.variance_epsilon = eps
- 
+
      def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
 -        input_dtype = hidden_states.dtype
 -        hidden_states = hidden_states.to(torch.float32)
@@ -1064,11 +1064,11 @@
 -        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
 -        return self.weight * hidden_states.to(input_dtype)
 +        return torch_npu.npu_rms_norm(hidden_states, self.weight, self.variance_epsilon)[0]
- 
+
      def extra_repr(self):
          return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
- 
- 
+
+
 -@use_kernel_func_from_hub("rotary_pos_emb")
 +# ======================================================================
 +# [PATCHED FUNCTION] apply_rotary_pos_emb
@@ -1077,7 +1077,7 @@
 +# ======================================================================
  def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
      """Applies Rotary Position Embedding to the query and key tensors.
- 
+
 @@ -1460,8 +1633,8 @@
      """
      cos = cos.unsqueeze(unsqueeze_dim)
@@ -1087,12 +1087,12 @@
 +    q_embed = torch_npu.npu_rotary_mul(q, cos, sin)
 +    k_embed = torch_npu.npu_rotary_mul(k, cos, sin)
      return q_embed, k_embed
- 
- 
+
+
 @@ -1661,6 +1834,12 @@
          return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
- 
- 
+
+
 +# ======================================================================
 +# [MODIFIED CLASS] Qwen3OmniMoeThinkerTextModel
 +# Methods patched: forward, _deepstack_process
@@ -1105,7 +1105,7 @@
 @@ -1693,35 +1872,35 @@
          # Initialize weights and apply final processing
          self.post_init()
- 
+
 +    # ================================================================
 +    # Patch: Qwen3OmniMoeThinkerTextModel.forward
 +    # Same outer shape as v5 upstream but:
@@ -1152,26 +1152,26 @@
 -        """
          if (input_ids is None) ^ (inputs_embeds is not None):
              raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
- 
+
 -        # torch.jit.trace() doesn't support cache objects in the output
          if use_cache and past_key_values is None and not torch.jit.is_tracing():
              past_key_values = DynamicCache(config=self.config)
- 
+
 @@ -1734,7 +1913,6 @@
                  past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
              )
- 
+
 -        # the hard coded `3` is for temporal, height and width.
          if position_ids is None:
              position_ids = cache_position.view(1, 1, -1).expand(3, inputs_embeds.shape[0], -1)
          elif position_ids.ndim == 2:
 @@ -1757,10 +1935,8 @@
- 
+
          hidden_states = inputs_embeds
- 
+
 -        # create position embeddings to be shared across the decoder layers
          position_embeddings = self.rotary_emb(hidden_states, position_ids)
- 
+
 -        # decoder layers
          for layer_idx, decoder_layer in enumerate(self.layers):
              layer_outputs = decoder_layer(
@@ -1179,21 +1179,21 @@
 @@ -1773,7 +1949,6 @@
              )
              hidden_states = layer_outputs
- 
+
 -            # add visual features to the hidden states of first several layers
              if deepstack_visual_embeds is not None and layer_idx in range(len(deepstack_visual_embeds)):
                  hidden_states = self._deepstack_process(
                      hidden_states,
 @@ -1783,18 +1958,37 @@
- 
+
          hidden_states = self.norm(hidden_states)
- 
+
 -        return MoeModelOutputWithPast(  # only diff with Qwen3VLTextModel
 +        return MoeModelOutputWithPast(
              last_hidden_state=hidden_states,
              past_key_values=past_key_values,
          )
- 
+
 +    # ================================================================
 +    # Patch: Qwen3OmniMoeThinkerTextModel._deepstack_process
 +    # 1. [FSDP] If visual_pos_masks is None (no visual input on this rank) still
@@ -1225,9 +1225,9 @@
 +        local_this = hidden_states[visual_pos_masks, :].clone() + visual_embeds
          hidden_states[visual_pos_masks, :] = local_this
          return hidden_states
- 
+
 @@ -1890,6 +2084,12 @@
- 
+
      overall_loss = torch.sum(tokens_per_expert * router_prob_per_expert.unsqueeze(0))
      return overall_loss * num_experts
 +
@@ -1236,13 +1236,13 @@
 +# [MODIFIED CLASS] Qwen3OmniMoeThinkerForConditionalGeneration
 +# Methods patched: get_audio_features, get_position_id_func, forward
 +# ======================================================================
- 
- 
+
+
  @auto_docstring(
 @@ -1967,38 +2167,26 @@
          pixel_values = pixel_values.type(self.visual.dtype)
          return self.visual(pixel_values, grid_thw=image_grid_thw, **kwargs)
- 
+
 +    # ================================================================
 +    # Patch: Qwen3OmniMoeThinkerForConditionalGeneration.get_audio_features
 +    # Simplified to the VeOmni training path: input_features is already the
@@ -1289,13 +1289,13 @@
 +            feature_lens=audio_feature_lengths,
 +        )
 +        return audio_outputs.last_hidden_state
- 
+
      def get_placeholder_mask(
          self,
 @@ -2050,6 +2238,25 @@
          special_audio_mask = special_audio_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
          return special_image_mask, special_video_mask, special_audio_mask
- 
+
 +    # ================================================================
 +    # Patch: Qwen3OmniMoeThinkerForConditionalGeneration.forward
 +    # 1. [Constants] Use VeOmni data constants for multimodal token indices (via
@@ -1395,11 +1395,11 @@
          output_router_logits = (
              output_router_logits if output_router_logits is not None else self.config.text_config.output_router_logits
          )
- 
+
          if inputs_embeds is None:
 -            # 1. Extract the input embeddings
              inputs_embeds = self.get_input_embeddings()(input_ids)
- 
+
 -        visual_embeds_multiscale = None
 -        visual_pos_masks = None
 -        image_mask, video_mask = None, None
@@ -1464,7 +1464,7 @@
 +            # --- Patch.5 ---
 +
 +        fake_deepstack = None
- 
+
          if pixel_values is not None:
              image_outputs: BaseModelOutputWithDeepstackFeatures = self.get_image_features(
                  pixel_values, image_grid_thw, return_dict=True
@@ -1502,7 +1502,7 @@
 +            inputs_embeds = inputs_embeds + fake_embeds
 +            fake_deepstack = fake_vision.deepstack_features
 +            # --- Patch.5 ---
- 
+
          if pixel_values_videos is not None:
              video_outputs: BaseModelOutputWithDeepstackFeatures = self.get_video_features(
                  pixel_values_videos, video_grid_thw, return_dict=True
@@ -1632,7 +1632,7 @@
 +            if fake_deepstack is not None:
 +                deepstack_visual_embeds = fake_deepstack
 +            # --- Patch.5 ---
- 
+
          if attention_mask is not None and position_ids is None:
 -            past_key_values_length = 0 if past_key_values is None else past_key_values.get_seq_length()
 -            if past_key_values_length == 0 or self.rope_deltas is None:
@@ -1670,7 +1670,7 @@
 +        # --- Patch.3 ---
 +        kwargs.update(flash_attn_kwargs)
 +        # --- Patch.3 ---
- 
+
          outputs = self.model(
              attention_mask=attention_mask,
 @@ -2235,19 +2526,28 @@
@@ -1682,7 +1682,7 @@
              visual_pos_masks=visual_pos_masks,
              **kwargs,
          )
- 
+
          hidden_states = outputs[0]
 -        logits = self.lm_head(hidden_states)
 -
@@ -1704,7 +1704,7 @@
 +        else:
 +            logits = self.lm_head(hidden_states)
 +        # --- Patch.8 ---
- 
+
          aux_loss = None
          if output_router_logits:
 @@ -2257,8 +2557,8 @@
@@ -1715,7 +1715,7 @@
 -                loss += self.router_aux_loss_coef * aux_loss.to(loss.device)  # make sure to reside in the same device
 +            if labels is not None and isinstance(aux_loss, torch.Tensor):
 +                loss = loss + self.router_aux_loss_coef * aux_loss.to(loss.device)
- 
+
          return Qwen3OmniMoeThinkerCausalLMOutputWithPast(
              loss=loss,
 @@ -2267,6 +2567,7 @@
@@ -1725,11 +1725,11 @@
 +            router_logits=getattr(outputs, "router_logits", None),
              rope_deltas=self.rope_deltas,
          )
- 
+
 @@ -2319,1548 +2620,97 @@
- 
+
          return model_inputs
- 
+
 -
 -class Qwen3OmniMoeTalkerResizeMLP(nn.Module):
 -    def __init__(self, config: Qwen3OmniMoeTalkerConfig):
@@ -3283,12 +3283,12 @@
 +# [MODIFIED CLASS] Qwen3OmniMoeForConditionalGeneration
 +# Methods patched: __init__, enable_talker, forward, get_position_id_func, get_parallel_plan
 +# ======================================================================
- 
- 
+
+
  class Qwen3OmniMoeForConditionalGeneration(Qwen3OmniMoePreTrainedModel, GenerationMixin):
      config_class = Qwen3OmniMoeConfig
      output_modalities = ("text", "audio")
- 
+
 -    def __init__(self, config: Qwen3OmniMoeConfig):
 +    # ================================================================
 +    # Patch: Qwen3OmniMoeForConditionalGeneration.__init__
@@ -3353,13 +3353,13 @@
 +            "talker / code2wav are not available in the VeOmni training modeling. "
 +            "Use the upstream transformers implementation for TTS generation."
 +        )
- 
+
      def disable_talker(self):
          if hasattr(self, "talker"):
 @@ -4132,19 +2982,40 @@
- 
+
          return thinker_result.sequences, talker_wavs.float()
- 
+
 +    # ================================================================
 +    # Patch: Qwen3OmniMoeForConditionalGeneration.forward
 +    # Simplified training path: only forward through thinker; talker +
@@ -3388,7 +3388,7 @@
 +        from ..parallel_plan import get_parallel_plan as _get_parallel_plan
 +
 +        return _get_parallel_plan()
- 
+
  __all__ = [
      "Qwen3OmniMoeForConditionalGeneration",
      "Qwen3OmniMoeThinkerTextModel",
