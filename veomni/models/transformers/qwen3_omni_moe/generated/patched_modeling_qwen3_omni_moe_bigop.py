@@ -152,7 +152,7 @@ class Qwen3OmniMoePreTrainedModel(PreTrainedModel):
     base_model_prefix = "model"
     input_modalities = ("image", "video", "audio", "text")
     supports_gradient_checkpointing = True
-    _no_split_modules = ["Qwen3OmniMoeDecoderLayer", "Qwen3OmniMoeVisionBlock"]
+    _no_split_modules = ["Qwen3OmniMoeDecoderLayer", "Qwen3OmniMoeVisionEncoder"]
     _skip_keys_device_placement = "past_key_values"
     _supports_flash_attn = True
     _supports_sdpa = True
@@ -1126,7 +1126,7 @@ class Qwen3OmniMoeAudioEncoder(Qwen3OmniMoePreTrainedModel):
     config: Qwen3OmniMoeAudioEncoderConfig
     main_input_name = "input_features"
     input_modalities = "audio"
-    _no_split_modules = ["Qwen3OmniMoeAudioEncoderLayer"]
+    _no_split_modules = ["Qwen3OmniMoeAudioEncoder"]
     _supports_sdpa = True
     _can_record_outputs = {
         "hidden_states": Qwen3OmniMoeAudioEncoderLayer,
@@ -2119,7 +2119,7 @@ class Qwen3OmniMoeVisionPatchEmbed(nn.Module):
 
 class Qwen3OmniMoeVisionEncoder(Qwen3OmniMoePreTrainedModel):
     config: Qwen3OmniMoeVisionEncoderConfig
-    _no_split_modules = ["Qwen3OmniMoeVisionBlock"]
+    _no_split_modules = ["Qwen3OmniMoeVisionEncoder"]
     _can_record_outputs = {
         "router_logits": OutputRecorder(Qwen3OmniMoeTextTopKRouter, layer_name="mlp.gate", index=0),
         "hidden_states": Qwen3OmniMoeVisionBlock,
@@ -2742,25 +2742,6 @@ class Qwen3OmniMoeThinkerTextBigopDecoderLayer(torch.autograd.Function):
         return grad_input, grad_weight, grad_bias
 
     @staticmethod
-    def _moe_scatter_forward(input_, scatter_index):
-        moe_scatter_logits_layer = torch.classes.xpu_ops.MOEScatterLogits()
-        return moe_scatter_logits_layer.moe_scatter_logits_forward(
-            input_,
-            None,
-            scatter_index,
-            scatter_index.shape[1],
-        )
-
-    @staticmethod
-    def _moe_scatter_backward(expert_output, scatter_index):
-        reverted_output = expert_output[scatter_index.flatten()].reshape(
-            -1,
-            scatter_index.shape[1],
-            expert_output.shape[-1],
-        )
-        return reverted_output.sum(dim=1)
-
-    @staticmethod
     def forward(
         ctx,
         hidden_states,
@@ -2995,95 +2976,74 @@ class Qwen3OmniMoeThinkerTextBigopDecoderLayer(torch.autograd.Function):
         moe_routing_weights = routing_weights.to(hidden_states_reshaped.dtype)
 
         # ----------------------------
-        # 4.2.1 Expert Histogram
+        # 4.2.1 Expert histogram for grouped matmul
         # ----------------------------
         splits = torch.histc(
-            selected_experts.float(), bins=experts.num_experts, min=0.0, max=float(experts.num_experts - 1)
-        ).to(dtype=torch.int32)
+            selected_experts.float(),
+            bins=experts.num_experts,
+            min=0.0,
+            max=float(experts.num_experts),
+        ).to(dtype=torch.int64)
 
         # ----------------------------
-        # 4.2.2 compute the each token's index in result
-        # scatter_index shape (batch_size * sequence_len, topk)
+        # 4.2.2 Dispatch tokens by expert with the NPU MoE token permute op
         # ----------------------------
-        idx_f = selected_experts.flatten().to(torch.float32)  # 1. on-device float
-        scatter_index = idx_f.argsort(stable=True)  # 2. aiCore ArgSort
-        scatter_index = scatter_index.to(torch.float32).argsort()  # 3. aiCore ArgSort
-        scatter_index = scatter_index.int().view(selected_experts.shape)  # 4. back to int
-        del idx_f
-
-        # ----------------------------
-        # 4.2.3 compute the result, select tokens by scatter_index, and put them together
-        # scatter_output shape (batch_size * sequence_len * topk, hidden_size)
-        # ----------------------------
-        moe_scatter_logits_layer = torch.classes.xpu_ops.MOEScatterLogits()
-        scatter_output = moe_scatter_logits_layer.moe_scatter_logits_forward(
-            hidden_states_reshaped, None, scatter_index, scatter_index.shape[1]
+        scatter_output, scatter_index = torch_npu.npu_moe_token_permute(
+            hidden_states_reshaped,
+            selected_experts.to(torch.int32),
         )
+        scatter_index = scatter_index.view_as(selected_experts)
 
         # ----------------------------
-        # 4.2.4 compute linear layer fc1
-        # cumsum_t = torch.cumsum(splits, dim=0).to(torch.int64)
-        # fc1 = gmm(input, gate_up_proj)
+        # 4.2.3 Grouped fc1
         # ----------------------------
-        fc1_output = torch.ops.xpu_ops.moe_linear_forward(
-            scatter_output,
-            experts.gate_up_proj,
-            None,  # bias
-            splits,
-            False,  # transpose_input
-            True,  # transpose_weight
-        )
+        fc1_output = torch_npu.npu_grouped_matmul(
+            [scatter_output],
+            [experts.gate_up_proj.transpose(1, 2)],
+            bias=None,
+            group_list=splits,
+            split_item=2,
+            group_type=0,
+            group_list_type=1,
+        )[0]
 
         # ----------------------------
-        # 4.2.5 compute the actication of linear layer fc1
+        # 4.2.4 SwiGLU activation
         # fc1_activation shape is (batch_size * sequence_len * topk, ffn_dim)
         # ----------------------------
-        fc1_activation = torch_npu.npu_swiglu(fc1_output)
+        fc1_activation = torch_npu.npu_swiglu(fc1_output, dim=-1)
 
         # ----------------------------
-        # 4.2.6 compute the the weighted linear layer fc1 result
-        # compute scattered_gate_weight, shape is (batch_size * sequence_len * topk)
-        # fc1_weighted_output shape is (batch_size * sequence_len * topk, ffn_dim)
-        # ----------------------------
-        reshaped_gate_weight = moe_routing_weights.reshape(-1, 1)
-        scattered_gate_weight = torch.empty_like(reshaped_gate_weight)
-        scattered_gate_weight[scatter_index.flatten()] = reshaped_gate_weight
-        fc1_weighted_output = fc1_activation * scattered_gate_weight
-        del moe_routing_weights, reshaped_gate_weight
-
-        # ----------------------------
-        # 4.2.7 compute linear layer fc2
+        # 4.2.5 Grouped fc2
         # fc2_output shape is (batch_size * sequence_len * topk, hidden_size)
         # ----------------------------
-        fc2_output = torch.ops.xpu_ops.moe_linear_forward(
-            fc1_weighted_output,
-            experts.down_proj,
-            None,  # bias
-            splits,
-            False,  # transpose_input
-            True,  # transpose_weight
-        )
+        fc2_output = torch_npu.npu_grouped_matmul(
+            [fc1_activation],
+            [experts.down_proj.transpose(1, 2)],
+            bias=None,
+            group_list=splits,
+            split_item=2,
+            group_type=0,
+            group_list_type=1,
+        )[0]
 
         # ----------------------------
-        # 4.2.8 gather the final token result by averate the the topk token results
+        # 4.2.6 Combine routed expert outputs with routing weights
         # ----------------------------
-        _in_range = torch.ones_like(scatter_index, dtype=torch.bool)
-        reverted_output = fc2_output[scatter_index.flatten()].reshape(
-            -1, scatter_index.shape[1], fc2_output.shape[-1]
+        final_hidden_states = torch_npu.npu_moe_token_unpermute(
+            fc2_output,
+            scatter_index.flatten(),
+            probs=moe_routing_weights,
         )
-        reverted_output = reverted_output * _in_range.unsqueeze(-1).to(reverted_output.dtype)
-        expert_output = reverted_output.sum(dim=1)
-        del _in_range, reverted_output, fc2_output
+        del moe_routing_weights
 
         # reshape the output with input shape
-        final_hidden_states = expert_output.reshape(hidden_states_reshaped.shape)
-
         hidden_states = final_hidden_states.reshape(
             batch_size,
             sequence_length,
             hidden_dim,
         )
-        del expert_output, final_hidden_states, hidden_states_reshaped
+        del final_hidden_states, hidden_states_reshaped
 
         # ============================================================
         # 5. residual add
@@ -3125,8 +3085,7 @@ class Qwen3OmniMoeThinkerTextBigopDecoderLayer(torch.autograd.Function):
             scatter_output,
             fc1_output,
             fc1_activation,
-            scattered_gate_weight,
-            fc1_weighted_output,
+            fc2_output,
         )
         ctx.input_layernorm = input_layernorm
         ctx.self_attn = self_attn
@@ -3182,8 +3141,7 @@ class Qwen3OmniMoeThinkerTextBigopDecoderLayer(torch.autograd.Function):
             scatter_output,
             fc1_output,
             fc1_activation,
-            scattered_gate_weight,
-            fc1_weighted_output,
+            fc2_output,
         ) = ctx.saved_tensors
         if hasattr(ctx, "maybe_clear_saved_tensors"):
             ctx.maybe_clear_saved_tensors()
@@ -3221,58 +3179,66 @@ class Qwen3OmniMoeThinkerTextBigopDecoderLayer(torch.autograd.Function):
         # ------------------------------------------------------------
 
         # ----------------------------
-        # 4.2.8 gather backward
-        # origin:
-        #   expert_output = reverted_output.sum(dim=1)
+        # 4.2.6 combine backward
+        # Equivalent graph:
+        #   npu_moe_token_unpermute(grouped_fc2_output, scatter_index, probs=routing_weights)
         # ----------------------------
-        grad_fc2_output = layer_cls._moe_scatter_forward(
+        grad_unpermute_output, _ = torch_npu.npu_moe_token_permute(
             grad_mlp_output,
-            scatter_index,
+            selected_experts.to(torch.int32),
         )
         del grad_mlp_output
 
         # ----------------------------
-        # 4.2.7 fc2 backward
+        # 4.2.5 routing-weight combine backward
         # origin:
-        #   fc2_output = moe_linear_forward(fc1_weighted_output, down_proj, ...)
+        #   final_hidden_states = npu_moe_token_unpermute(fc2_output, scatter_index, probs=routing_weights)
         # ----------------------------
-        grad_fc1_weighted_output = torch.ops.xpu_ops.moe_linear_forward(
-            grad_fc2_output,
-            experts.down_proj,
-            None,
-            splits,
-            False,
-            False,
-        )
-        grad_down_proj = None
-        if experts.down_proj.requires_grad:
-            grad_down_proj = torch.ops.xpu_ops.moe_linear_backward(
-                grad_fc2_output,
-                fc1_weighted_output,
-                None,
-                splits,
-                True,
-                False,
-            )
-        del grad_fc2_output, fc1_weighted_output
-
-        # ----------------------------
-        # 4.2.6 routing weight multiply backward
-        # origin:
-        #   fc1_weighted_output = fc1_activation * scattered_gate_weight
-        # ----------------------------
-        grad_fc1_activation = grad_fc1_weighted_output * scattered_gate_weight
-        grad_scattered_gate_weight = torch.sum(
-            fc1_activation * grad_fc1_weighted_output,
+        grad_scattered_routing_weights = torch.sum(
+            fc2_output * grad_unpermute_output,
             dim=-1,
             keepdim=True,
         )
-        grad_routing_weights = grad_scattered_gate_weight[scatter_index.flatten()].reshape_as(routing_weights)
+        grad_routing_weights = grad_scattered_routing_weights[scatter_index.flatten()].reshape_as(routing_weights)
         grad_routing_weights = grad_routing_weights.to(router_probs.dtype)
-        del fc1_activation, scattered_gate_weight, grad_fc1_weighted_output, grad_scattered_gate_weight
+        del grad_scattered_routing_weights, fc2_output
+
+        scattered_routing_weights, _ = torch_npu.npu_moe_token_permute(
+            routing_weights.to(grad_unpermute_output.dtype).reshape(-1, 1),
+            selected_experts.reshape(-1, 1).to(torch.int32),
+        )
+        grad_fc2_output = grad_unpermute_output * scattered_routing_weights
+        del grad_unpermute_output, scattered_routing_weights
 
         # ----------------------------
-        # 4.2.5 swiglu backward
+        # 4.2.4 fc2 backward
+        # origin:
+        #   fc2_output = npu_grouped_matmul(fc1_activation, down_proj.T, ...)
+        # ----------------------------
+        grad_fc1_activation = torch_npu.npu_grouped_matmul(
+            [grad_fc2_output],
+            [experts.down_proj],
+            bias=None,
+            group_list=splits,
+            split_item=2,
+            group_type=0,
+            group_list_type=1,
+        )[0]
+        grad_down_proj = None
+        if experts.down_proj.requires_grad:
+            grad_down_proj = torch_npu.npu_grouped_matmul(
+                [fc1_activation.transpose(0, 1)],
+                [grad_fc2_output],
+                bias=None,
+                group_list=splits,
+                split_item=3,
+                group_type=2,
+                group_list_type=1,
+            )[0].transpose(1, 2)
+        del grad_fc2_output, fc1_activation
+
+        # ----------------------------
+        # 4.2.3 swiglu backward
         # origin:
         #   fc1_activation = torch_npu.npu_swiglu(fc1_output)
         # ----------------------------
@@ -3285,37 +3251,41 @@ class Qwen3OmniMoeThinkerTextBigopDecoderLayer(torch.autograd.Function):
         # ----------------------------
         # 4.2.4 fc1 backward
         # origin:
-        #   fc1_output = moe_linear_forward(scatter_output, gate_up_proj, ...)
+        #   fc1_output = npu_grouped_matmul(scatter_output, gate_up_proj.T, ...)
         # ----------------------------
-        grad_scatter_output = torch.ops.xpu_ops.moe_linear_forward(
-            grad_fc1_output,
-            experts.gate_up_proj,
-            None,
-            splits,
-            False,
-            False,
-        )
+        grad_scatter_output = torch_npu.npu_grouped_matmul(
+            [grad_fc1_output],
+            [experts.gate_up_proj],
+            bias=None,
+            group_list=splits,
+            split_item=2,
+            group_type=0,
+            group_list_type=1,
+        )[0]
         grad_gate_up_proj = None
         if experts.gate_up_proj.requires_grad:
-            grad_gate_up_proj = torch.ops.xpu_ops.moe_linear_backward(
-                grad_fc1_output,
-                scatter_output,
-                None,
-                splits,
-                True,
-                False,
-            )
+            grad_gate_up_proj = torch_npu.npu_grouped_matmul(
+                [scatter_output.transpose(0, 1)],
+                [grad_fc1_output],
+                bias=None,
+                group_list=splits,
+                split_item=3,
+                group_type=2,
+                group_list_type=1,
+            )[0].transpose(1, 2)
         del grad_fc1_output, scatter_output, splits
 
         # ----------------------------
         # 4.2.3 scatter backward
         # origin:
-        #   scatter_output = moe_scatter_logits_forward(hidden_states_reshaped, ...)
+        #   scatter_output = npu_moe_token_permute(hidden_states_reshaped, selected_experts)
         # ----------------------------
-        grad_mlp_input = layer_cls._moe_scatter_backward(
-            grad_scatter_output,
-            scatter_index,
-        ).reshape_as(post_layernorm_output)
+        grad_mlp_input = grad_scatter_output[scatter_index.flatten()].reshape(
+            -1,
+            scatter_index.shape[1],
+            grad_scatter_output.shape[-1],
+        )
+        grad_mlp_input = grad_mlp_input.sum(dim=1).reshape_as(post_layernorm_output)
         del grad_scatter_output, scatter_index
 
         # ----------------------------
@@ -3950,7 +3920,7 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
     base_model_prefix = "thinker"
     _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
     _no_split_modules = [
-        "Qwen3OmniMoeAudioEncoderLayer",
+        "Qwen3OmniMoeAudioEncoder",
         "Qwen3OmniMoeThinkerTextDecoderLayer",
     ]
     _can_record_outputs = {
@@ -4538,8 +4508,8 @@ class Qwen3OmniMoeForConditionalGeneration(Qwen3OmniMoePreTrainedModel, Generati
         # --- Patch.3 ---
         self._no_split_modules = {
             "Qwen3OmniMoeThinkerTextDecoderLayer",
-            "Qwen3OmniMoeVisionBlock",
-            "Qwen3OmniMoeAudioEncoderLayer",
+            "Qwen3OmniMoeVisionEncoder",
+            "Qwen3OmniMoeAudioEncoder",
         }
         # --- Patch.3 ---
 
