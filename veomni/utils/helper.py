@@ -434,6 +434,37 @@ def enable_full_determinism(seed: int):
         torch.npu.manual_seed(seed)
         torch.npu.manual_seed_all(seed)
 
+# def enable_full_determinism(seed: int):
+#     """
+#     Seed-only reproducibility (NOT strict deterministic execution).
+#     """
+
+#     # 只保留 seed 控制
+#     os.environ["PYTHONHASHSEED"] = str(seed)
+
+#     random.seed(seed)
+#     np.random.seed(seed)
+#     torch.manual_seed(seed)
+#     torch.cuda.manual_seed(seed)
+#     torch.cuda.manual_seed_all(seed)
+
+#     if IS_NPU_AVAILABLE:
+#         torch.npu.manual_seed(seed)
+#         torch.npu.manual_seed_all(seed)
+
+#     # 不再开启 deterministic algorithms
+#     # torch.use_deterministic_algorithms(False)
+
+#     # 不强制 cudnn deterministic
+#     # torch.backends.cudnn.deterministic = False
+#     # torch.backends.cudnn.benchmark = True  # 通常建议开启以提速
+
+#     # 不设置这些环境变量（删除或不要设置）
+#     # CUBLAS_WORKSPACE_CONFIG
+#     # NCCL_DETERMINISTIC
+#     # FLASH_ATTENTION_DETERMINISTIC
+#     # CLOSE_MATMUL_K_SHIFT
+
 
 def set_seed(seed: int, full_determinism: bool = False) -> None:
     """
