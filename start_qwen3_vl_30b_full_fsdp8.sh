@@ -59,10 +59,10 @@ train:
     save_hf_weights: false
     save_steps: 999
   dyn_bsz_margin: 0
-  global_batch_size: 8
+  global_batch_size: 16
   init_device: meta
   max_steps: 100
-  micro_batch_size: 1
+  micro_batch_size: 2
   optimizer:
     lr: 0.0003
     lr_decay_ratio: 1.0

@@ -7,8 +7,8 @@
 #
 # Output layout: builds the patchgen sdist from ``patchgen-pkg/`` and
 # extracts its contents into ``<repo-root>/output/`` (the typical CI
-# product-output directory). Extracting — rather than copying the
-# ``.tar.gz`` itself — matches the convention where the platform re-tars
+# product-output directory). Extracting 鈥?rather than copying the
+# ``.tar.gz`` itself 鈥?matches the convention where the platform re-tars
 # whatever lives under ``output/`` into the final distribution artifact;
 # leaving the sdist tarball in place would produce a tarball-in-tarball.
 #

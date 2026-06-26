@@ -36,7 +36,7 @@ if [[ -d "$TARGET_DIR" ]]; then
         exit 1
     fi
 
-    echo "Directory .${AGENT_NAME}/ already exists and looks healthy — skipping."
+    echo "Directory .${AGENT_NAME}/ already exists and looks healthy 鈥?skipping."
     exit 0
 fi
 

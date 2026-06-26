@@ -6,7 +6,7 @@
 # pin (``transformers==5.2.0`` from the ``transformers-stable`` group in
 # pyproject.toml). We therefore launch via ``uv run --with`` which installs
 # the override into a per-invocation cache under ~/.cache/uv/ and prepends
-# that cache to PYTHONPATH — the project's ``.venv`` is never modified
+# that cache to PYTHONPATH 鈥?the project's ``.venv`` is never modified
 # (``--no-sync`` skips the auto-sync that would otherwise touch it).
 # Setting TRANSFORMERS_VERSION lets you swap the override without editing
 # the script.
@@ -84,8 +84,8 @@ fi
     --enable_cpu_offload \
     "${EXTRA_ARGS[@]}"
 
-# ──────────────────────────────────────────────────────────────────────────────
-# I2V (image-to-video) variant — uncomment to use, requires --input_image:
+# 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+# I2V (image-to-video) variant 鈥?uncomment to use, requires --input_image:
 #
 # "${LAUNCHER[@]}" "${REPO_ROOT}/scripts/inference/infer_omni.py" \
 #     --model_path Wan-AI/Wan2.1-I2V-14B-480P-Diffusers \
@@ -97,4 +97,4 @@ fi
 #     --height 480 --width 832 --num_frames 81 --fps 15 \
 #     --guidance_scale 5.0 --seed 42 --dtype bfloat16 \
 #     --enable_cpu_offload
-# ──────────────────────────────────────────────────────────────────────────────
+# 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
