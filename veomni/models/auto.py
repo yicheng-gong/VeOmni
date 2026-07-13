@@ -13,6 +13,7 @@
 # limitations under the License.
 
 
+import os
 import functools
 import sys
 from typing import TYPE_CHECKING, Any, Dict, Literal, Optional, Union
@@ -252,12 +253,37 @@ def build_foundation_model(
         )
         original_forward = model.forward
 
+        def make_single_cu_seq_lens(cu_seq_lens):
+            cu_seq_lens = cu_seq_lens.cpu()
+
+            total_len = int(cu_seq_lens[-1].item())
+
+            return torch.tensor(
+                [0, total_len],
+                dtype=cu_seq_lens.dtype,
+                device="cpu",
+            )
+
         @functools.wraps(original_forward)
         def wrapped_forward(*args, **kwargs):
-            if "cu_seq_lens_q" in kwargs and kwargs["cu_seq_lens_q"] is not None:
-                kwargs["cu_seq_lens_q"] = kwargs["cu_seq_lens_q"].cpu()
-            if "cu_seq_lens_k" in kwargs and kwargs["cu_seq_lens_k"] is not None:
-                kwargs["cu_seq_lens_k"] = kwargs["cu_seq_lens_k"].cpu()
+            cu_seq_lens_mode = os.getenv("CU_SEQ_LENS_MODE", "normal").lower()
+
+            if cu_seq_lens_mode == "normal":
+                if "cu_seq_lens_q" in kwargs and kwargs["cu_seq_lens_q"] is not None:
+                    kwargs["cu_seq_lens_q"] = kwargs["cu_seq_lens_q"].cpu()
+                if "cu_seq_lens_k" in kwargs and kwargs["cu_seq_lens_k"] is not None:
+                    kwargs["cu_seq_lens_k"] = kwargs["cu_seq_lens_k"].cpu()
+            elif cu_seq_lens_mode == "maxlen":
+                if "cu_seq_lens_q" in kwargs and kwargs["cu_seq_lens_q"] is not None:
+                    kwargs["cu_seq_lens_q"] = make_single_cu_seq_lens(kwargs["cu_seq_lens_q"])
+                if "cu_seq_lens_k" in kwargs and kwargs["cu_seq_lens_k"] is not None:
+                    kwargs["cu_seq_lens_k"] = make_single_cu_seq_lens(kwargs["cu_seq_lens_k"])
+            else:
+                raise ValueError(
+                    f"Unsupported CU_SEQ_LENS_MODE={cu_seq_lens_mode!r}, "
+                    "expected 'normal' or 'maxlen'"
+                )
+            
             return original_forward(*args, **kwargs)
 
         model.forward = wrapped_forward

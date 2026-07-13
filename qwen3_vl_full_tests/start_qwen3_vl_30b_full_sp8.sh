@@ -15,6 +15,9 @@ export MULTI_STREAM_MEMORY_REUSE=2
 export TASK_QUEUE_ENABLE=2
 export CPU_AFFINITY_CONF=1
 
+export DETERMINISM_LEVEL="seed"
+export CU_SEQ_LENS_MODE="normal"
+
 # Create temporary config file
 cat > ./training_config.yaml << 'EOF'
 data:
@@ -48,21 +51,21 @@ model:
 train:
   enable_full_determinism: true
   accelerator:
-    ep_size: 8
+    ep_size: 1
     fsdp_config:
       fsdp_mode: fsdp2
       full_shard: true
-    ulysses_size: 1
+    ulysses_size: 8
   checkpoint:
     manager: dcp
     output_dir: ./
     save_hf_weights: false
     save_steps: 999
   dyn_bsz_margin: 0
-  global_batch_size: 8
+  global_batch_size: 16
   init_device: meta
   max_steps: 100
-  micro_batch_size: 1
+  micro_batch_size: 16
   optimizer:
     lr: 0.0003
     lr_decay_ratio: 1.0

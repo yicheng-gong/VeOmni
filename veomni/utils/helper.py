@@ -66,6 +66,7 @@ VALID_CONFIG_TYPE = None
 VEOMNI_UPLOAD_CMD = None
 FlopsCounter = None
 
+determinism_level = os.getenv("DETERMINISM_LEVEL", "strict").lower()
 
 def convert_hdfs_fuse_path(*args, **kwargs):
     if len(args) > 0:
@@ -403,67 +404,62 @@ def enable_high_precision_for_bf16():
         torch.npu.matmul.allow_tf32 = False
         torch.npu.matmul.allow_bf16_reduced_precision_reduction = False
 
+if determinism_level == "strict":
+    def enable_full_determinism(seed: int):
+        """
+        Helper function for reproducibility in distributed training.
+        See https://pytorch.org/docs/stable/notes/randomness.html for details.
+        """
 
-# def enable_full_determinism(seed: int):
-#     """
-#     Helper function for reproducibility in distributed training.
-#     See https://pytorch.org/docs/stable/notes/randomness.html for details.
-#     """
+        os.environ["PYTHONHASHSEED"] = str(seed)
+        os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":16:8"
+        os.environ["NCCL_DETERMINISTIC"] = "1"
+        os.environ["FLASH_ATTENTION_DETERMINISTIC"] = "1"
+        if IS_NPU_AVAILABLE:
+            # The environment variable required to enable deterministic mode on Ascend NPUs.
+            os.environ["HCCL_DETERMINISTIC"] = "true"
+            os.environ["CLOSE_MATMUL_K_SHIFT"] = "1"
 
-#     os.environ["PYTHONHASHSEED"] = str(seed)
-#     os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":16:8"
-#     os.environ["NCCL_DETERMINISTIC"] = "1"
-#     os.environ["FLASH_ATTENTION_DETERMINISTIC"] = "1"
-#     if IS_NPU_AVAILABLE:
-#         # The environment variable required to enable deterministic mode on Ascend NPUs.
-#         os.environ["NCCL_DETERMINISTIC"] = "true"
-#         os.environ["CLOSE_MATMUL_K_SHIFT"] = "1"
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        torch.use_deterministic_algorithms(True, warn_only=True)
+        # Enable CUDNN deterministic mode
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.enabled = False
 
-#     random.seed(seed)
-#     np.random.seed(seed)
-#     torch.manual_seed(seed)
-#     torch.cuda.manual_seed(seed)
-#     torch.cuda.manual_seed_all(seed)
-#     torch.use_deterministic_algorithms(True, warn_only=True)
-#     # Enable CUDNN deterministic mode
-#     torch.backends.cudnn.deterministic = True
-#     torch.backends.cudnn.benchmark = False
-#     torch.backends.cudnn.enabled = False
+        if IS_NPU_AVAILABLE:
+            torch.npu.manual_seed(seed)
+            torch.npu.manual_seed_all(seed)
+elif determinism_level == "seed":
+    def enable_full_determinism(seed: int):
+        """
+        Seed-only reproducibility (NOT strict deterministic execution).
+        """
 
-#     if IS_NPU_AVAILABLE:
-#         torch.npu.manual_seed(seed)
-#         torch.npu.manual_seed_all(seed)
+        # 只保留 seed 控制
+        os.environ["PYTHONHASHSEED"] = str(seed)
 
-def enable_full_determinism(seed: int):
-    """
-    Seed-only reproducibility (NOT strict deterministic execution).
-    """
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
 
-    # 只保留 seed 控制
-    os.environ["PYTHONHASHSEED"] = str(seed)
+        if IS_NPU_AVAILABLE:
+            torch.npu.manual_seed(seed)
+            torch.npu.manual_seed_all(seed)
+else:
+    def enable_full_determinism(seed: int):
+        pass
 
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-
-    if IS_NPU_AVAILABLE:
-        torch.npu.manual_seed(seed)
-        torch.npu.manual_seed_all(seed)
-
-    # 不再开启 deterministic algorithms
-    # torch.use_deterministic_algorithms(False)
-
-    # 不强制 cudnn deterministic
-    # torch.backends.cudnn.deterministic = False
-    # torch.backends.cudnn.benchmark = True  # 通常建议开启以提速
-
-    # 不设置这些环境变量（删除或不要设置）
-    # CUBLAS_WORKSPACE_CONFIG
-    # NCCL_DETERMINISTIC
-    # FLASH_ATTENTION_DETERMINISTIC
-    # CLOSE_MATMUL_K_SHIFT
+    raise ValueError(
+            f"Unsupported DETERMINISM_LEVEL={determinism_level!r}, "
+            "expected 'strict' or 'seed'"
+        )
 
 
 def set_seed(seed: int, full_determinism: bool = False) -> None:

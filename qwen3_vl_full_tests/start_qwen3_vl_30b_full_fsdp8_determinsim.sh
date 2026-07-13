@@ -15,6 +15,9 @@ export MULTI_STREAM_MEMORY_REUSE=2
 export TASK_QUEUE_ENABLE=2
 export CPU_AFFINITY_CONF=1
 
+export DETERMINISM_LEVEL="strict"
+export CU_SEQ_LENS_MODE="normal"
+
 # Create temporary config file
 cat > ./training_config.yaml << 'EOF'
 data:
@@ -26,7 +29,7 @@ data:
     num_workers: 8
   datasets_type: iterable
   max_seq_len: 16384
-  train_path: /home/g00878120/dataset/ShareGPT4V/sharegpt4v_instruct_gpt4-vision_cap100k_coco_abs.json
+  train_path: /home/g00878120/dataset/ShareGPT4V/shards_cap100k_coco_abs_64
   train_size: 80000000
   mm_configs:
     image_max_pixels: 602112 # 28 * 28 * 768
